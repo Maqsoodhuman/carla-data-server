@@ -86,6 +86,7 @@ class ClientSession:
     ego_actor_id: Optional[int] = None
     role: str = "spectator"
     last_seen: float = field(default_factory=time.monotonic)
+    last_control: Optional[dict] = None  # persisted ego control, reapplied every tick
 
 
 @dataclass
@@ -132,6 +133,7 @@ class CarlaConnection:
         self._original_settings = None
         self._lock = threading.Lock()
         self._sensors: Dict[int, "carla.Sensor"] = {}
+        self._actor_cache: Dict[int, "carla.Actor"] = {}  # id -> direct reference
 
     def connect(self):
         if not CARLA_AVAILABLE:
@@ -170,6 +172,29 @@ class CarlaConnection:
             log.info("CARLA settings restored")
         except Exception as e:
             log.warning("CARLA cleanup error: %s", e)
+
+    def apply_and_tick(self, controls: list):
+        """Apply controls and tick in a single lock hold.
+        controls is a list of (actor_id, control_dict) tuples.
+        Uses cached actor references instead of world.get_actor()
+        because get_actor() returns objects that don't properly
+        apply controls in sync mode (CARLA custom build quirk)."""
+        if not CARLA_AVAILABLE:
+            return
+        with self._lock:
+            for actor_id, control in controls:
+                actor = self._actor_cache.get(actor_id)
+                if actor is None:
+                    continue
+                vc = carla.VehicleControl(
+                    throttle=float(control.get("throttle", 0)),
+                    steer=float(control.get("steer", 0)),
+                    brake=float(control.get("brake", 0)),
+                    hand_brake=bool(control.get("hand_brake", False)),
+                    reverse=bool(control.get("reverse", False)),
+                )
+                actor.apply_control(vc)
+            self.world.tick()
 
     def tick(self):
         if not CARLA_AVAILABLE:
@@ -284,6 +309,7 @@ class CarlaConnection:
             actor = self.world.try_spawn_actor(bp, t)
             if actor is None:
                 return None
+            self._actor_cache[actor.id] = actor  # cache direct reference
             if autopilot and actor.type_id.startswith("vehicle."):
                 actor.set_autopilot(True)
             if actor.type_id.startswith("sensor."):
@@ -313,7 +339,9 @@ class CarlaConnection:
         if not CARLA_AVAILABLE:
             return True
         with self._lock:
-            actor = self.world.get_actor(actor_id)
+            actor = self._actor_cache.pop(actor_id, None)
+            if actor is None:
+                actor = self.world.get_actor(actor_id)
             if actor is None:
                 return False
             if actor_id in self._sensors:
@@ -487,7 +515,17 @@ class TickLoopThread(threading.Thread):
             t0 = time.monotonic()
 
             self._drain_commands()
-            self.carla.tick()
+
+            # Apply controls and tick in a single lock hold, matching
+            # how CARLA's manual_control.py does it (apply then tick
+            # with no gap between them)
+            with self.state.clients_lock:
+                controls_to_apply = [
+                    (session.ego_actor_id, session.last_control)
+                    for session in self.state.clients.values()
+                    if session.ego_actor_id and session.last_control
+                ]
+            self.carla.apply_and_tick(controls_to_apply)
             self._tick += 1
             self._sim_time += self.tick_interval
 
@@ -510,21 +548,41 @@ class TickLoopThread(threading.Thread):
                 log.warning("TickLoop overrun: %.1f ms", elapsed * 1000)
 
     def _drain_commands(self):
+        # Collect all commands, but for ego_control, only keep the last per client
+        pending = []
+        last_ego_control = {}  # client_id -> (cmd, ack)
+
         while True:
             try:
                 cmd: Command = self.state.command_queue.get_nowait()
             except queue.Empty:
-                return
+                break
 
             ack = {"type": "ack", "client_id": cmd.client_id,
                    "command": cmd.type,
                    "status": "ok", "message": "", "actor_id": 0}
+
+            if cmd.type == "ego_control":
+                last_ego_control[cmd.client_id] = (cmd, ack)
+            else:
+                pending.append((cmd, ack))
+
+        # Process non-ego commands first
+        for cmd, ack in pending:
             try:
                 self._apply_command(cmd, ack)
             except Exception as e:
                 log.exception("Command error: %s", e)
                 ack.update({"status": "failed", "message": str(e)})
+            self._send_ack(cmd.client_id, ack)
 
+        # Then apply only the last ego_control per client
+        for client_id, (cmd, ack) in last_ego_control.items():
+            try:
+                self._apply_command(cmd, ack)
+            except Exception as e:
+                log.exception("Command error: %s", e)
+                ack.update({"status": "failed", "message": str(e)})
             self._send_ack(cmd.client_id, ack)
 
     def _apply_command(self, cmd: Command, ack: dict):
@@ -532,7 +590,14 @@ class TickLoopThread(threading.Thread):
             with self.state.clients_lock:
                 session = self.state.clients.get(cmd.client_id)
             if session and session.ego_actor_id:
-                self.carla.apply_control(session.ego_actor_id, cmd.payload)
+                # Only update last_control here. The actual apply_control
+                # happens in apply_and_tick, once per tick, right before world.tick()
+                session.last_control = cmd.payload
+                log.info("SERVER RX: ego=%d thr=%.1f brk=%.1f str=%.3f",
+                         session.ego_actor_id,
+                         cmd.payload.get("throttle", 0),
+                         cmd.payload.get("brake", 0),
+                         cmd.payload.get("steer", 0))
             else:
                 ack.update({"status": "failed", "message": "no ego actor assigned"})
 
