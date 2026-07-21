@@ -41,6 +41,23 @@ cd ~/Documents/carla/PythonAPI/examples
 python3 generate_traffic.py -n 50 -w 0 --host localhost --port 2000
 ```
 
+> **NOTE — First run on UBAutonomousProvingGrounds:** CARLA builds a nav-mesh/local-map
+> cache the first time this map is loaded. `generate_traffic.py` will appear hung for
+> 5-15 minutes. This is normal — do NOT kill it. Subsequent runs are instant.
+
+> **NOTE — Spawn point cap:** `UBAutonomousProvingGrounds` has ~125 usable spawn points.
+> Requesting more than that (e.g. `-n 500`) silently under-spawns without error.
+> Check the actual count first:
+> ```bash
+> python3 -c "
+> import carla
+> c = carla.Client('localhost', 2000); c.set_timeout(5)
+> pts = c.get_world().get_map().get_spawn_points()
+> print(f'Available spawn points: {len(pts)}')
+> "
+> ```
+> Then use that number (or less) as your `-n` value.
+
 ### Manual Control (pygame on lab PC)
 ```bash
 source ~/Documents/carla-data-server/carla-data-server/venv/bin/activate
