@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+venv-stub/
+.venv/
+
+# Protobuf generated (regenerate with grpc_tools.protoc)
+carla-data-server/server/world_state_pb2.py
+
+# Logs
+*.log
+unity_log.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Unity build artifacts (if added later)
+*.x86_64
+*.data
+*.sym

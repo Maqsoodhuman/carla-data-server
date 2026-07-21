@@ -1,0 +1,146 @@
+syntax = "proto3";
+
+package ubmr.carla;
+
+// ─────────────────────────────────────────────
+//  Common primitives
+// ─────────────────────────────────────────────
+
+message Vector3 {
+  float x = 1;
+  float y = 2;
+  float z = 3;
+}
+
+message Rotation {
+  float pitch = 1;
+  float yaw   = 2;
+  float roll  = 3;
+}
+
+message Transform {
+  Vector3  location = 1;
+  Rotation rotation = 2;
+}
+
+// ─────────────────────────────────────────────
+//  World state actors
+// ─────────────────────────────────────────────
+
+message Vehicle {
+  uint32    id           = 1;
+  string    type_id      = 2;   // e.g. "vehicle.tesla.model3"
+  Transform transform    = 3;
+  Vector3   velocity     = 4;
+  Vector3   angular_vel  = 5;
+  bool      is_ego       = 6;   // true if client owns this actor
+}
+
+message Pedestrian {
+  uint32    id        = 1;
+  string    type_id   = 2;
+  Transform transform = 3;
+  Vector3   velocity  = 4;
+}
+
+enum TrafficLightState {
+  RED    = 0;
+  YELLOW = 1;
+  GREEN  = 2;
+  OFF    = 3;
+}
+
+message TrafficLight {
+  uint32            id        = 1;
+  Transform         transform = 2;
+  TrafficLightState state     = 3;
+  float             elapsed   = 4;  // seconds in current state
+}
+
+message SensorData {
+  uint32 actor_id   = 1;   // vehicle this sensor belongs to
+  string sensor_type = 2;  // "lidar" | "camera" | "radar"
+  string encoding   = 3;   // "raw" | "base64" | "pcd"
+  bytes  data       = 4;
+  uint64 frame      = 5;
+}
+
+// ─────────────────────────────────────────────
+//  Server → Client  (pushed every tick)
+// ─────────────────────────────────────────────
+
+message WorldState {
+  uint64               tick          = 1;
+  double               timestamp     = 2;   // CARLA simulation time (s)
+  double               wall_time     = 3;   // unix epoch (s)
+  repeated Vehicle     vehicles      = 4;
+  repeated Pedestrian  pedestrians   = 5;
+  repeated TrafficLight traffic_lights = 6;
+  repeated SensorData  sensors       = 7;
+}
+
+// ─────────────────────────────────────────────
+//  Client → Server  (commands)
+// ─────────────────────────────────────────────
+
+message VehicleControl {
+  float throttle   = 1;   // [0, 1]
+  float steer      = 2;   // [-1, 1]
+  float brake      = 3;   // [0, 1]
+  bool  hand_brake = 4;
+  bool  reverse    = 5;
+}
+
+message SpawnRequest {
+  string    blueprint_id = 1;   // e.g. "vehicle.tesla.model3"
+  Transform transform    = 2;
+  bool      autopilot    = 3;
+}
+
+message DestroyRequest {
+  uint32 actor_id = 1;
+}
+
+message SubscribeRequest {
+  repeated string topics = 1;
+  // valid topics: "vehicles" "pedestrians" "traffic_lights" "sensors"
+}
+
+message ClientCommand {
+  string client_id = 1;
+  oneof payload {
+    VehicleControl  ego_control     = 2;
+    SpawnRequest    spawn           = 3;
+    DestroyRequest  destroy         = 4;
+    SubscribeRequest subscribe      = 5;
+  }
+}
+
+// ─────────────────────────────────────────────
+//  Server → Client  (acknowledgements)
+// ─────────────────────────────────────────────
+
+enum AckStatus {
+  OK      = 0;
+  FAILED  = 1;
+  DENIED  = 2;
+}
+
+message CommandAck {
+  string    client_id  = 1;
+  AckStatus status     = 2;
+  string    message    = 3;
+  uint32    actor_id   = 4;   // set on successful spawn
+}
+
+// ─────────────────────────────────────────────
+//  Envelope  (all WebSocket frames use this)
+// ─────────────────────────────────────────────
+
+message Envelope {
+  oneof payload {
+    WorldState   world_state  = 1;
+    ClientCommand command     = 2;
+    CommandAck   ack          = 3;
+  }
+}
