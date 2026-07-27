@@ -2,6 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Working conventions
+
+These bias toward caution over speed. For trivial tasks, use judgment.
+
+1. **Think before coding.** Don't assume — state assumptions explicitly, or ask if uncertain. If multiple interpretations exist, present them rather than picking silently. If a simpler approach exists, say so. If something is unclear, stop and ask rather than guessing.
+2. **Simplicity first.** Minimum code that solves the problem — nothing speculative. No features beyond what was asked, no abstractions for single-use code, no unrequested flexibility/configurability, no error handling for impossible scenarios. If it could be a quarter the length, rewrite it.
+3. **Surgical changes.** Touch only what the task requires. Don't "improve" adjacent code, comments, or formatting; don't refactor working code; match existing style even if you'd do it differently. If you notice unrelated dead code, mention it rather than deleting it. Do remove imports/variables/functions that your own change made unused, but leave pre-existing dead code alone. Every changed line should trace directly to the request.
+4. **Goal-driven execution.** Turn vague tasks into verifiable goals ("fix the bug" → reproduce with a test, then make it pass) and state a brief plan with a verification step per item before multi-step work.
+
 ## Repository layout
 
 This repo has a doubly nested `carla-data-server/carla-data-server/` structure — the inner directory is the actual project root. All commands below assume you `cd carla-data-server/carla-data-server` first.
@@ -45,10 +54,6 @@ python bridges/ws_to_udp_bridge.py --server ws://<host>:8765 \
                                    --udp-host localhost --udp-port 12345
 ```
 
-Regenerate protobuf bindings if `proto/world_state.proto` changes:
-```
-protoc --python_out=server proto/world_state.proto
-```
 
 ## Architecture
 
@@ -63,7 +68,7 @@ Cross-thread queues (`queue.Queue` for command/broadcast, `asyncio.Queue` for se
 
 ## Wire protocol
 
-All frames are JSON objects with a `"type"` field over WebSocket. `proto/world_state.proto` and `server/serializer.py` define an equivalent protobuf schema — `serializer.py` is a swap-in encode/decode module, but the running server currently uses JSON exclusively. Keep JSON and proto in sync when adding fields.
+All frames are JSON objects with a `"type"` field over WebSocket. JSON is the only wire format. `proto/world_state.proto` is kept as a schema sketch for a possible binary format later; nothing reads it, and there is no encoder — the `serializer.py` swap-in module and its generated bindings were removed as dead code. If you revive protobuf, regenerate with `protoc --python_out=server proto/world_state.proto` and write the encoder then.
 
 Server → client message types: `welcome`, `world_state`, `ack`, `client_left`.
 Client → server command types (see `VALID_COMMANDS` in `server.py`): `ego_control`, `spawn`, `destroy`, `subscribe`, `list_spawn_points`, `ping`, `spawn_sensor`.

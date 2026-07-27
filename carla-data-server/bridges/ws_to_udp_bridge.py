@@ -1,15 +1,31 @@
 """
 WebSocket-to-UDP Bridge for UB-MR
-==================================
-Subscribes to the CARLA Data Server over WebSocket, receives world_state
-messages at 20 Hz, converts them to Rahul's TrafficReceiver format, and
-sends them over UDP to the UB-MR Unity app.
+=================================
+
+What it is
+----------
+The last hop between the CARLA Data Server and the UB-MR Unity app, which
+speaks UDP JSON and knows nothing of the server's WebSocket protocol. Unlike
+the mirror bridge it does not build on CARLAClient - it uses raw websockets,
+because it only consumes world_state and never sends commands.
+
+What it does
+------------
+Subscribes, receives world_state at 20 Hz, reshapes each into the
+TrafficReceiver format, sends it over UDP. TrafficReceiver.cs listens on port
+12345 and spawns or moves vehicle GameObjects from what arrives.
+
+How it works
+------------
+The conversion is lossy by design: Unity needs only id, blueprint, colour,
+location and yaw, so pedestrians, traffic lights and sensor frames are dropped
+rather than serialised and ignored downstream. UDP is fire-and-forget - at
+20 Hz a lost frame is replaced ~50 ms later, so retransmission would cost more
+latency than the loss. The WebSocket side reconnects on failure; the UDP socket
+is connectionless and needs none.
 
 Usage:
     python3 bridges/ws_to_udp_bridge.py --server ws://128.205.222.211:8765 --udp-host localhost --udp-port 12345
-
-The Unity app (TrafficReceiver.cs) listens on UDP port 12345 and spawns
-vehicle GameObjects based on the received data.
 """
 
 import argparse
@@ -39,7 +55,7 @@ class WStoUDPBridge:
         self.last_log = 0.0
 
     def convert_world_state(self, state):
-        """Convert our world_state format to Rahul's TrafficReceiver format."""
+        """Reshape a server world_state into the Unity TrafficReceiver format."""
         vehicles = []
         for v in state.get("vehicles", []):
             transform = v.get("transform", {})
@@ -125,6 +141,7 @@ class WStoUDPBridge:
                                 self.last_log = now
                     finally:
                         ping_task.cancel()
+                        await asyncio.gather(ping_task, return_exceptions=True)
 
             except (websockets.exceptions.ConnectionClosed,
                     ConnectionRefusedError, OSError,

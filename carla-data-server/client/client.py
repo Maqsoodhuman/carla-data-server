@@ -1,36 +1,39 @@
 """
-CARLA Data Client  (patched + ping / peer-left)
-================================================
-Base WebSocket client that receives world state from the CARLA Data Server
-and renders / processes the scene locally.
+CARLA Data Client
+=================
 
-Extend CARLAClient and override on_world_state() for your use case:
-  - AutowareClient  -> publish to ROS2 topics
-  - MRAgentClient   -> forward to Unity via shared memory / UDP
-  - ManualClient    -> pygame render loop
-  - SpectatorClient -> read-only display
+What it is
+----------
+The base class every consumer of the CARLA Data Server builds on. It owns the
+connection, reconnect loop, heartbeat and latency tracking, so subclasses only
+handle world state.
 
-What changed in this revision
------------------------------
-  * Background ping task: sends {type: "ping", payload: {client_ts}} every
-    PING_INTERVAL seconds. Server echoes back via the ack channel with both
-    client_ts (preserved) and server_ts (server's wall clock at handling).
-  * RTT and one-way latency tracking using a bounded deque (avg/min/max).
-    See get_latency_stats(). Mirrors the pattern from peer Telemetry classes.
-  * Ping doubles as heartbeat - if the client is alive, the server sees
-    inbound traffic at least every PING_INTERVAL, well under any silence
-    timeout.
-  * on_peer_left(client_id, owned_actor_ids) override hook for handling
-    client_left broadcasts from the server.
+What it does
+------------
+Connects, subscribes, and hands each frame to an overridable hook -
+on_world_state, on_ack, on_connected, on_peer_left:
 
-Patches kept from previous revision
------------------------------------
-  * Catches asyncio.TimeoutError in the reconnect loop.
-  * Catches all websockets exceptions, not just ConnectionClosed.
-  * _enqueue() uses the running loop captured at startup (Python 3.10+ safe).
-  * Bounded reconnect backoff with attempt logging.
-  * Cleaner shutdown when Ctrl+C arrives.
-  * asyncio.wait(FIRST_COMPLETED) to avoid sender hang on close.
+  AutowareClient  -> ROS2 topics       ManualClient     -> pygame render loop
+  MRAgentClient   -> Unity via UDP     SpectatorClient  -> read-only display
+
+ManualControlClient below is the worked example: a LISTING -> SPAWNING ->
+DRIVING -> DONE state machine driven by ack callbacks.
+
+How it works
+------------
+Three coroutines per connection - receiver, sender draining an outbound queue,
+and a ping loop - joined with asyncio.wait(FIRST_COMPLETED) so any one exiting
+tears the connection down instead of hanging the sender on a closed socket.
+
+The ping loop sends client_ts every PING_INTERVAL (2s); the server echoes it
+back with server_ts, feeding a bounded deque of RTT samples (see
+get_latency_stats). It doubles as the heartbeat. Ping acks are consumed
+internally and NOT forwarded to on_ack, so subclasses never filter them - any
+future RPC-shaped command should do the same (see ack_is_ping).
+
+Reconnect treats timeouts and all websockets exceptions as retryable, with
+bounded backoff. _enqueue() dispatches onto the loop captured at startup, which
+is what makes it safe to call from other threads.
 
 Usage
 -----

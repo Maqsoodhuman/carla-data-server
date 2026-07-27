@@ -20,11 +20,7 @@ import asyncio
 import json
 import logging
 import time
-import sys
-import os
 import statistics
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "client"))
 
 import websockets
 import websockets.exceptions

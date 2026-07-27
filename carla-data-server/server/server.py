@@ -1,27 +1,41 @@
 """
-CARLA Data Server  (patched + heartbeat / peer-presence / latency)
-==================================================================
-Multi-threaded WebSocket server that mirrors CARLA world state to remote clients.
+CARLA Data Server
+=================
 
-Threads
--------
-  TickLoopThread       - drains commands, calls world.tick(), snapshots state
-  CommandProcessor     - validates commands, hands them to a per-tick buffer
-  BroadcastThread      - fans world_state out to per-client send queues
-  SensorBuffer         - holds the latest frame from each attached sensor
-  Async ws_server      - websockets.serve loop, one handler coroutine per client
-  Async janitor        - evicts silent clients past SILENCE_TIMEOUT
+What it is
+----------
+The hub of a hub-and-spoke topology: one process owns the only connection to
+CARLA and mirrors world state to any number of clients over WebSocket. Clients
+never talk to CARLA directly, or to each other. With no CARLA PythonAPI
+installed it runs in STUB mode on synthetic actors, so the pipeline is testable
+without a simulator.
 
-What changed in this revision
------------------------------
-  * App-level heartbeat: every inbound frame bumps session.last_seen.
-  * Janitor task evicts clients silent past --silence-timeout (default 5s)
-    and broadcasts client_left to remaining clients.
-  * client_left broadcast on any disconnect (clean close OR janitor eviction),
-    carrying the actor_ids the client owned so peers can react immediately.
-  * ping command: server echoes client_ts back plus its own server_ts.
-    Client uses this for RTT / one-way latency estimation.
-  * Timed-out clients have their ego actor destroyed (configurable later).
+What it does
+------------
+Each tick: advance CARLA in sync mode, snapshot the world (vehicles,
+pedestrians, traffic lights, latest sensor frame), fan it out to subscribers as
+a JSON world_state. Inbound it accepts ego_control, spawn, destroy, subscribe,
+list_spawn_points, ping and spawn_sensor, and evicts clients that go silent.
+
+How it works
+------------
+  TickLoopThread   - only writer to CARLA. Drains commands, ticks, snapshots.
+  BroadcastThread  - filters each snapshot per client, caches the JSON per
+                     unique (subscription, ego) key, fills per-client queues.
+  SensorBuffer     - not a thread; sensor callbacks write here, tick loop reads.
+
+Asyncio side: a sender and receiver coroutine per client (the receiver
+validates against VALID_COMMANDS and queues - there is no separate command
+processor), plus janitor (evicts silent clients) and peer_event_fanout
+(broadcasts client_left).
+
+Queues are the only path between these pieces. Every asyncio queue is bounded
+and drops oldest, so a slow client cannot stall the tick loop.
+
+Liveness is app-level, not WebSocket ping: any inbound frame bumps last_seen,
+clients ping every 2s, janitor evicts past --silence-timeout. Eviction destroys
+the client's ego and broadcasts client_left with its actor ids; a clean
+disconnect does the same. ping is echoed with both timestamps for RTT.
 
 Usage
 -----
@@ -87,6 +101,7 @@ class ClientSession:
     role: str = "spectator"
     last_seen: float = field(default_factory=time.monotonic)
     last_control: Optional[dict] = None  # persisted ego control, reapplied every tick
+    owned_sensor_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -193,7 +208,14 @@ class CarlaConnection:
                     hand_brake=bool(control.get("hand_brake", False)),
                     reverse=bool(control.get("reverse", False)),
                 )
-                actor.apply_control(vc)
+                try:
+                    actor.apply_control(vc)
+                except Exception as e:
+                    # Actor was likely destroyed out-of-band; drop it from the
+                    # cache so we stop trying to drive it every tick.
+                    log.warning("apply_control failed for actor %d, evicting: %s",
+                                actor_id, e)
+                    self._actor_cache.pop(actor_id, None)
             self.world.tick()
 
     def tick(self):
@@ -262,22 +284,6 @@ class CarlaConnection:
             "traffic_lights": traffic_lights,
             "sensors": sensors,
         }
-
-    def apply_control(self, actor_id: int, control: dict):
-        if not CARLA_AVAILABLE:
-            return
-        with self._lock:
-            actor = self.world.get_actor(actor_id)
-            if actor is None:
-                return
-            vc = carla.VehicleControl(
-                throttle=float(control.get("throttle", 0)),
-                steer=float(control.get("steer", 0)),
-                brake=float(control.get("brake", 0)),
-                hand_brake=bool(control.get("hand_brake", False)),
-                reverse=bool(control.get("reverse", False)),
-            )
-            actor.apply_control(vc)
 
     def spawn_actor(self, blueprint_id: str, transform: Optional[dict],
                     autopilot: bool, spawn_point_index: Optional[int] = None) -> Optional[int]:
@@ -516,29 +522,35 @@ class TickLoopThread(threading.Thread):
 
             self._drain_commands()
 
-            # Apply controls and tick in a single lock hold, matching
-            # how CARLA's manual_control.py does it (apply then tick
-            # with no gap between them)
-            with self.state.clients_lock:
-                controls_to_apply = [
-                    (session.ego_actor_id, session.last_control)
-                    for session in self.state.clients.values()
-                    if session.ego_actor_id and session.last_control
-                ]
-            self.carla.apply_and_tick(controls_to_apply)
-            self._tick += 1
-            self._sim_time += self.tick_interval
-
-            world_state = self.carla.snapshot(self._tick, self._sim_time)
-
+            # A transient CARLA error or a destroyed actor must not kill this
+            # daemon thread — that would silently freeze all broadcasts while
+            # clients stay connected. Log and continue to the next tick.
             try:
-                self.state.broadcast_queue.put_nowait(world_state)
-            except queue.Full:
+                # Apply controls and tick in a single lock hold, matching
+                # how CARLA's manual_control.py does it (apply then tick
+                # with no gap between them)
+                with self.state.clients_lock:
+                    controls_to_apply = [
+                        (session.ego_actor_id, session.last_control)
+                        for session in self.state.clients.values()
+                        if session.ego_actor_id and session.last_control
+                    ]
+                self.carla.apply_and_tick(controls_to_apply)
+                self._tick += 1
+                self._sim_time += self.tick_interval
+
+                world_state = self.carla.snapshot(self._tick, self._sim_time)
+
                 try:
-                    self.state.broadcast_queue.get_nowait()
-                except queue.Empty:
-                    pass
-                self.state.broadcast_queue.put_nowait(world_state)
+                    self.state.broadcast_queue.put_nowait(world_state)
+                except queue.Full:
+                    try:
+                        self.state.broadcast_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self.state.broadcast_queue.put_nowait(world_state)
+            except Exception as e:
+                log.exception("TickLoop iteration error: %s", e)
 
             elapsed = time.monotonic() - t0
             sleep_time = self.tick_interval - elapsed
@@ -593,7 +605,7 @@ class TickLoopThread(threading.Thread):
                 # Only update last_control here. The actual apply_control
                 # happens in apply_and_tick, once per tick, right before world.tick()
                 session.last_control = cmd.payload
-                log.info("SERVER RX: ego=%d thr=%.1f brk=%.1f str=%.3f",
+                log.debug("SERVER RX: ego=%d thr=%.1f brk=%.1f str=%.3f",
                          session.ego_actor_id,
                          cmd.payload.get("throttle", 0),
                          cmd.payload.get("brake", 0),
@@ -673,6 +685,10 @@ class TickLoopThread(threading.Thread):
                 )
                 if sensor_id:
                     ack["actor_id"] = sensor_id
+                    with self.state.clients_lock:
+                        session = self.state.clients.get(cmd.client_id)
+                        if session:
+                            session.owned_sensor_ids.append(sensor_id)
                 else:
                     ack.update({"status": "failed", "message": "sensor spawn failed"})
 
@@ -843,15 +859,25 @@ async def handle_client(ws: WebSocketServerProtocol, state: ServerState,
         # Determine ownership BEFORE removing the session, so we can both
         # destroy the ego actor (if appropriate) and tell other clients.
         owned_actor_ids: List[int] = []
+        owned_sensor_ids: List[int] = []
         with state.clients_lock:
             sess = state.clients.pop(client_id, None)
             state.client_tasks.pop(client_id, None)
             if sess and sess.ego_actor_id is not None:
                 owned_actor_ids.append(sess.ego_actor_id)
+            if sess:
+                owned_sensor_ids.extend(sess.owned_sensor_ids)
 
-        # Best-effort: destroy the client's ego actor on disconnect.
+        # Best-effort: destroy the client's sensors first, then its ego actor,
+        # on disconnect. Without this, an evicted/abruptly-closed client leaves
+        # its camera's last frame in SensorBuffer, rebroadcast to peers forever.
         # CARLA calls happen on whichever thread; CarlaConnection's lock
         # serializes them safely.
+        for sid in owned_sensor_ids:
+            try:
+                carla_conn.destroy_actor(int(sid))
+            except Exception as e:
+                log.warning("Failed to destroy sensor %d on disconnect: %s", sid, e)
         for aid in owned_actor_ids:
             try:
                 carla_conn.destroy_actor(int(aid))
@@ -954,7 +980,7 @@ async def ws_server(host: str, port: int, state: ServerState,
             )
         except NotImplementedError:
             signal.signal(getattr(signal, signame),
-                          lambda s, f: _stop_from_signal(signame))
+                          lambda s, f, n=signame: _stop_from_signal(n))
 
     janitor_task = asyncio.create_task(janitor(state))
     fanout_task = asyncio.create_task(peer_event_fanout(state))
