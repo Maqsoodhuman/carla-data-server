@@ -65,6 +65,7 @@ class _Collector(CARLAClient):
         self.states = []            # (monotonic_recv_time, message)
         self.connections = []       # (monotonic_time, client_id)
         self.acks = []              # every ack except pings (filtered upstream)
+        self.ack_times = []         # (monotonic_time, ack)
         self.peers_left = []        # (peer_id, owned_actor_ids)
         self.approx_bytes = 0
         self.ego_id = None          # set from the spawn ack
@@ -83,8 +84,19 @@ class _Collector(CARLAClient):
     def on_ack(self, ack):
         with self.lock:
             self.acks.append(ack)
+            self.ack_times.append((time.monotonic(), ack))
             if ack.get("command") == wire.CMD_SPAWN and ack.get("actor_id"):
                 self.ego_id = ack["actor_id"]
+
+    def subscribe_applied_at(self):
+        """When the server acked our subscribe. Before this the session still
+        carries the server's default subscription set, so anything received
+        earlier says nothing about whether filtering works."""
+        with self.lock:
+            for when, ack in self.ack_times:
+                if ack.get("command") == wire.CMD_SUBSCRIBE:
+                    return when
+        return None
 
     def on_peer_left(self, peer_id, owned_actor_ids):
         with self.lock:
@@ -275,12 +287,28 @@ def scenario_world_state(ctx: ScenarioContext) -> Outcome:
         "subscribed_topics_present", not missing,
         expected=f"every message carries {subscriptions}", observed=f"missing {missing}"))
 
+    # Filtering can only be judged once the server has applied our subscribe.
+    # Before that the session still holds the server's default topic set, so
+    # early messages legitimately carry everything - measured below, not
+    # asserted on, because that default is a server design choice.
+    applied_at = collector.subscribe_applied_at()
+    steady = ([msg for when, msg in states if applied_at and when > applied_at]
+              if applied_at else messages)
     unsubscribed = sorted(set(wire.VALID_TOPICS) - set(subscriptions))
-    leaked = sorted({t for t in unsubscribed for msg in messages if t in msg})
+    early = [msg for when, msg in states if applied_at and when <= applied_at]
+    early_leaks = sorted({t for t in unsubscribed for msg in early if t in msg})
+    metrics["messages_before_subscribe_applied"] = len(early)
+    metrics["topics_in_handshake_window"] = early_leaks
+    metrics["steady_state_messages"] = len(steady)
+
+    leaked = sorted({t for t in unsubscribed for msg in steady if t in msg})
     assertions.append(P.assertion(
         "unsubscribed_topics_absent", not leaked,
-        expected=f"no {unsubscribed} keys (server-side per-client filtering)",
-        observed=f"leaked {leaked}"))
+        expected=f"no {unsubscribed} keys once the subscribe has been applied",
+        observed=f"leaked {leaked}",
+        detail=(f"{len(early)} message(s) arrived before the subscribe ack carrying "
+                f"{early_leaks or 'nothing extra'}; that window is the server's "
+                f"default subscription set, not a filtering failure")))
 
     return Outcome(P.status_from_assertions(assertions), metrics, assertions)
 
