@@ -18,6 +18,7 @@ import threading
 import time
 
 from . import REPO_ROOT
+from . import gitsync
 from . import protocol as P
 from . import scenarios as S
 from .doctor import check_carla_map, run_doctor
@@ -85,7 +86,8 @@ class DataServerProcess:
 
 class LabWorker:
     def __init__(self, cfg, coordinator_client, suite=None, manage_server=True,
-                 on_failure="stop", worker_id=None):
+                 on_failure="stop", worker_id=None, auto_sync=False,
+                 max_retries=2, sync_interval=30.0):
         self.cfg = cfg
         self.api = coordinator_client
         self.suite = list(suite or S.DEFAULT_SUITE)
@@ -94,6 +96,14 @@ class LabWorker:
         self.worker_id = worker_id or f"lab-{os.uname().nodename}-{os.getpid()}"
         self.server = DataServerProcess(
             cfg, os.path.join(cfg.state_dir, "data-server.log")) if manage_server else None
+        # Phase 5: opt-in only. When on, new upstream commits are fast-forwarded
+        # and the scenarios that failed are retried - bounded by max_retries so
+        # a persistent failure cannot spin forever.
+        self.auto_sync = auto_sync
+        self.max_retries = max_retries
+        self.sync_interval = sync_interval
+        self._retries = {}
+        self._last_sync_check = 0.0
         self._stop = threading.Event()
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -168,9 +178,12 @@ class LabWorker:
         servicing requeued runs (`rerun`) and the lab actions they request.
         Without this a rerun would be advertised to a client with no data
         server behind it, and fail for the wrong reason."""
-        log.info("servicing requeued runs; Ctrl+C to stop")
+        log.info("servicing requeued runs%s; Ctrl+C to stop",
+                 "; auto-sync ON" if self.auto_sync else "")
         while not self._stop.is_set():
             try:
+                if self.auto_sync:
+                    self._maybe_sync()
                 for run in self.api.list_runs(limit=25):
                     if P.is_terminal(run["state"]):
                         continue
@@ -188,6 +201,84 @@ class LabWorker:
             except Exception as exc:
                 log.debug("service loop: %s", exc)
             time.sleep(POLL_INTERVAL)
+
+    # ── Phase 5: pick up pushed code and retest, without a human ────────────
+
+    def _maybe_sync(self):
+        """Fast-forward to new upstream commits, restart the data server so it
+        runs them, and requeue whatever failed. Bounded by max_retries."""
+        if time.monotonic() - self._last_sync_check < self.sync_interval:
+            return
+        self._last_sync_check = time.monotonic()
+        try:
+            status = gitsync.remote_is_ahead(REPO_ROOT)
+        except gitsync.GitError as exc:
+            log.debug("sync check failed: %s", exc)
+            return
+        if not status.get("ahead"):
+            if status.get("reason", "").startswith("diverged"):
+                log.warning("upstream diverged from local history - not syncing. "
+                            "A human needs to reconcile this.")
+                self._announce(f"auto-sync halted: {status['reason']}. HEAD "
+                               f"{status['head'][:8]}, remote "
+                               f"{status.get('remote_head', '?')[:8]}.")
+            return
+
+        log.info("upstream is ahead by %d commit(s); syncing",
+                 len(status.get("commits", [])))
+        try:
+            report = gitsync.sync_to(REPO_ROOT)
+        except gitsync.GitError as exc:
+            log.warning("sync refused: %s", exc)
+            self._announce(f"auto-sync refused: {exc}")
+            return
+        if not report["changed"]:
+            return
+
+        restarted = self.server.restart() if self.manage_server else False
+        summary = (f"synced {report['before'][:8]} -> {report['after'][:8]} "
+                   f"({len(report['commits'])} commit(s)); data server "
+                   f"{'restarted' if restarted else 'not restarted'}")
+        log.info(summary)
+        self._announce(summary + "\n" + "\n".join(report["commits"][:10]))
+        self._requeue_failures(report)
+
+    def _requeue_failures(self, report: dict):
+        """Retry scenarios that failed before this sync, newest result per
+        scenario, honouring the retry budget."""
+        latest = {}
+        for run in self.api.list_runs(limit=50):
+            if run["state"] in (P.FAIL, P.ERROR):
+                latest[run["scenario"]] = run
+            elif run["state"] == P.PASS:
+                latest.pop(run["scenario"], None)  # already fixed
+        for scenario, run in latest.items():
+            used = self._retries.get(scenario, 0)
+            if used >= self.max_retries:
+                log.warning("%s has used its %d retries - not requeuing again",
+                            scenario, self.max_retries)
+                self._announce(f"{scenario} still failing after {used} retries; "
+                               f"stopping automatic retries. Needs a human.")
+                continue
+            self._retries[scenario] = used + 1
+            new_run = self.api.create_run(
+                scenario=scenario, suite_id=run.get("suite_id", ""),
+                config=run.get("config"), created_by=f"{self.worker_id}:autosync",
+                timeout=S.TIMEOUTS.get(scenario))
+            self.api.transition(new_run["run_id"], P.LAB_PREPARING, actor=self.worker_id,
+                                detail=f"auto-retry after sync to {report['after'][:8]}")
+            ready, detail = self._prepare(scenario)
+            self.api.transition(new_run["run_id"], P.LAB_READY if ready else P.ERROR,
+                                actor=self.worker_id, detail=detail)
+            log.info("auto-requeued %s as %s (retry %d/%d)", scenario,
+                     new_run["run_id"], used + 1, self.max_retries)
+
+    def _announce(self, text: str):
+        """Tell the other machine's agent what the loop did."""
+        try:
+            self.api.post_message(self.worker_id, "all", text, kind="autosync")
+        except Exception as exc:
+            log.debug("could not post message: %s", exc)
 
     # ── one scenario ─────────────────────────────────────────────────────────
 
@@ -267,6 +358,24 @@ class LabWorker:
             ok = self.server.restart()
             self.api.complete_action(run_id, action["action_id"], ok,
                                      "data server restarted" if ok else "restart failed")
+        elif name == "sync_repo":
+            # Opt-in: this is how pushed code reaches this machine, so it stays
+            # off unless the operator started the worker with --auto-sync.
+            if not self.auto_sync:
+                self.api.complete_action(
+                    run_id, action["action_id"], False,
+                    "code sync is disabled on this worker; start it with --auto-sync "
+                    "to allow remotely-triggered fast-forwards")
+                return
+            try:
+                report = gitsync.sync_to(REPO_ROOT,
+                                         target=action["params"].get("commit"))
+                if report["changed"] and self.manage_server:
+                    self.server.restart()
+                self.api.complete_action(run_id, action["action_id"], True,
+                                         report["detail"] + f" -> {report['after'][:8]}")
+            except gitsync.GitError as exc:
+                self.api.complete_action(run_id, action["action_id"], False, str(exc))
         else:
             self.api.complete_action(run_id, action["action_id"], False,
                                      f"unknown lab action {name!r}")

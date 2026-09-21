@@ -49,6 +49,22 @@ def _api(cfg) -> CoordinatorClient:
     return CoordinatorClient(cfg.coordinator_url)
 
 
+def _format_summary(summary: dict) -> str:
+    if summary.get("aborted"):
+        return f"suite {summary.get('suite_id', '?')} aborted: {summary['aborted']}"
+    lines = [f"suite {summary.get('suite_id', '?')}  "
+             f"passed={summary.get('passed', 0)} failed={summary.get('failed', 0)} "
+             f"errored={summary.get('errored', 0)} skipped={summary.get('skipped', 0)}",
+             ""]
+    for run in summary.get("runs", []):
+        result = run.get("result") or {}
+        failed = [a["name"] for a in result.get("assertions", []) if not a.get("passed")]
+        lines.append(f"  {run.get('scenario', '?'):<18} {run.get('state', '?').upper():<8} "
+                     f"{run.get('run_id', '')}"
+                     + (f"  failed: {failed}" if failed else ""))
+    return "\n".join(lines)
+
+
 # ── commands ─────────────────────────────────────────────────────────────────
 
 def cmd_lab(args, cfg):
@@ -72,7 +88,13 @@ def cmd_lab(args, cfg):
     api = CoordinatorClient(f"http://127.0.0.1:{cfg.coordinator_port}"
                             if server else cfg.coordinator_url)
     worker = LabWorker(cfg, api, suite=suite, manage_server=not args.no_manage_server,
-                       on_failure=args.on_failure)
+                       on_failure=args.on_failure, auto_sync=args.auto_sync,
+                       max_retries=args.max_retries, sync_interval=args.sync_interval)
+    if args.auto_sync:
+        logging.getLogger("orchestration.lab").warning(
+            "--auto-sync is ON: upstream commits will be fast-forwarded and run on "
+            "this machine automatically. The coordinator has no authentication, so "
+            "only do this on a trusted network.")
     # Staying alive is pointless without the data server: reruns would be
     # advertised to a client with nothing behind them.
     worker._keep_server = args.keep_server or args.keep_alive
@@ -104,11 +126,27 @@ def cmd_lab(args, cfg):
 
 def cmd_client(args, cfg):
     api = _api(cfg)
-    try:
-        api.health()
-    except CoordinatorError as exc:
-        raise SystemExit(f"{exc}\n\nRun `python -m orchestration doctor --role client` "
-                         f"for a full diagnosis.")
+    # Start order must not matter: the client may come up before the lab, so
+    # wait for the coordinator instead of exiting. Noisy on purpose, so a
+    # genuinely wrong LAB_HOST is obvious rather than looking like patience.
+    clog = logging.getLogger("orchestration.client")
+    deadline = time.monotonic() + args.connect_timeout if args.connect_timeout else None
+    last_error, announced = None, 0.0
+    while True:
+        try:
+            api.health()
+            break
+        except CoordinatorError as exc:
+            last_error = exc
+            if deadline and time.monotonic() > deadline:
+                raise SystemExit(
+                    f"{exc}\n\nGave up after {args.connect_timeout:.0f}s. Run "
+                    f"`python -m orchestration doctor --role client` for a full "
+                    f"diagnosis, or pass --connect-timeout 0 to wait indefinitely.")
+            if time.monotonic() - announced > 15:
+                announced = time.monotonic()
+                clog.warning("waiting for the coordinator at %s ...", cfg.coordinator_url)
+            time.sleep(2.0)
     worker = ClientWorker(cfg, api, idle_timeout=args.idle_timeout)
 
     def _sigint(signum, frame):
@@ -308,11 +346,25 @@ def build_parser():
                      help="leave the data server running after the suite")
     lab.add_argument("--keep-alive", action="store_true",
                      help="keep the coordinator serving after the suite finishes")
+    lab.add_argument("--auto-sync", action="store_true",
+                     help="PHASE 5 (off by default): fast-forward to new upstream "
+                          "commits, restart the data server, and retry failed "
+                          "scenarios automatically. Only ever fast-forwards, never "
+                          "merges/rebases/resets, and refuses on a dirty tree. "
+                          "Implies remote code execution - only enable on a machine "
+                          "whose coordinator port is on a network you trust.")
+    lab.add_argument("--max-retries", type=int, default=2,
+                     help="auto-sync retries per scenario before giving up (default 2)")
+    lab.add_argument("--sync-interval", type=float, default=30.0,
+                     help="seconds between upstream checks when --auto-sync is on")
     lab.set_defaults(func=cmd_lab)
 
     client = sub.add_parser("client", help="run the CLIENT worker")
     client.add_argument("--idle-timeout", type=float,
                         help="exit after this many seconds with no work")
+    client.add_argument("--connect-timeout", type=float, default=300.0,
+                        help="how long to wait for the coordinator at startup "
+                             "(0 = wait indefinitely). Start order does not matter.")
     client.set_defaults(func=cmd_client)
 
     status = sub.add_parser("status", help="coordinator + worker + run snapshot")
