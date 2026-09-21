@@ -30,13 +30,38 @@ recorded as `error`, not `pass`.
 
 ## Scenarios
 
-| Scenario | Checks |
-| --- | --- |
-| `connectivity` | TCP reach, WebSocket handshake, `welcome` schema, first `world_state` |
-| `world_state` | message validity, tick strictly increasing, sim-time advancing, subscribed topics present, **unsubscribed topics absent** |
-| `sustained_stream` | rate within tolerance of tick rate, tick gaps bounded, no mid-run drop, ping/ack RTT bounded |
-| `reconnect` | lab restarts the data server; client must observe the outage, reconnect, get a new `client_id`, resume streaming |
-| `mirror` | `carla_mirror_client.py` replicates into a local shadow CARLA (SKIPPED without the CARLA PythonAPI + a reachable shadow) |
+| Scenario | Checks | Needs real CARLA? |
+| --- | --- | --- |
+| `connectivity` | TCP reach, WebSocket handshake, `welcome` schema, first `world_state` | no |
+| `world_state` | message validity, tick strictly increasing, sim-time advancing, subscribed topics present, **unsubscribed topics absent** | no |
+| `sustained_stream` | rate within tolerance of tick rate, tick gaps bounded, no mid-run drop, ping/ack RTT bounded | no |
+| `ego_control` | throttle actually accelerates the car and braking slows it; no failed control acks | **yes** |
+| `multi_client` | two participants, each with its own ego: own car flagged `is_ego`, peer's car not, both agree on the vehicle set and on peer position | **yes** |
+| `peer_departure` | a participant leaves: peers get `client_left` naming its `owned_actor_ids`, and its car leaves the world | partly |
+| `udp_bridge` | `ws_to_udp_bridge.py` delivers Unity-shaped UDP packets carrying `tick`/`sim_time`, ticks advancing | no |
+| `reconnect` | lab restarts the data server; client must observe the outage, reconnect, get a new `client_id`, resume streaming | no |
+| `mirror` | `carla_mirror_client.py` replicates into a shadow CARLA, maps match, actors appear | **yes** + shadow sim |
+| `camera_follow` | `scripts/camera_follow.py` repositions a local CARLA spectator to track an actor | **yes** |
+
+Scenarios that need a real simulator are **SKIPPED**, never passed or failed,
+when the server is in STUB mode or no CARLA is reachable — STUB mode serves a
+fixed synthetic world in which a spawned actor never appears, so actor-level
+assertions cannot mean anything there.
+
+### Role parity with UB-DigitalTwin
+
+The suite is built to cover the same responsibilities UB-DigitalTwin splits
+across Redis roles, so this server can stand in for that hub:
+
+| UB-DigitalTwin role | Their message type | Covered here by |
+| --- | --- | --- |
+| `traffic-publisher` | 2 (traffic batch) | the data server itself (authoritative) |
+| `traffic-renderer` | subscribes 2 | `mirror` |
+| `ego-renderer` | 0 (participant pose) | `multi_client` (peer car visible and correctly placed) |
+| `multi-agent-renderer` | 0 / 1 | `multi_client` + `peer_departure` |
+| `manual-control` | 0 | `ego_control` |
+| `udp-bridge` | 3 (MR ego relay) | `udp_bridge` |
+| `camera-follow` | none (reads CARLA directly) | `camera_follow` |
 
 RTT comes from the ping/ack round trip, not `wall_time` deltas — across two
 machines with unsynced clocks, wall-clock latency is meaningless, so it is
@@ -151,15 +176,71 @@ other machine can diagnose without re-running anything.
 | `websockets_legacy_api` FAIL | `server.py` uses the legacy asyncio API removed in websockets 14+. `pip install 'websockets<14'`. |
 | Run stuck, then `error` with `kind: timeout` | The coordinator swept it past its deadline; check the other machine's worker is alive via `status`. |
 
+## Phase 5 — automated code sync (opt-in)
+
+```
+python -m orchestration lab --keep-alive --auto-sync
+```
+
+Every `--sync-interval` seconds (30 by default) the lab worker checks the
+remote, fast-forwards, restarts the data server so it runs the new code, and
+re-queues the scenarios that had failed — bounded by `--max-retries` (2) so a
+persistent failure cannot spin forever. It announces what it did on the agent
+mailbox.
+
+Safety rules, all covered by `tests/test_orch_gitsync.py` against real repos:
+
+- **fast-forward only** — never merges, rebases, resets, checks out or forces
+- **refuses a dirty working tree** — stops and names the files rather than
+  stashing or discarding
+- **refuses diverged history** — messages both sides instead of guessing
+- **never commits or pushes** — authoring stays with a human or an agent under
+  human supervision
+
+**It is off by default, and should stay off unless you understand this:** the
+coordinator has no authentication, so anything that can reach its port could
+trigger a sync, which is remote code execution on the lab machine. Only enable
+it on a network you control, ideally while watching.
+
+## Agent mailbox
+
+The session on each machine can talk to the other through the coordinator
+rather than a human copying text:
+
+```
+python -m orchestration mail send --to lab --sender client-agent --text "..."
+python -m orchestration mail read --to client --watch
+```
+
+Messages are ordered, durable across coordinator restarts, and filterable by
+recipient (`lab`, `client`, or `all`).
+
 ## Scope and limits
 
-Verified on a single machine in STUB mode (coordinator, both workers, all five
-scenarios). **Unverified**: real CARLA behavior, genuine cross-machine
-networking, and the `mirror` scenario against a real shadow simulator — those
-need the lab hardware. See `docs/lab-test-plan.md` for the manual checks that
-still need real CARLA.
+Status as of 2026-09-21, and what each claim rests on:
 
-Autonomous source-code modification (agent diagnoses → commits → other machine
-pulls → restarts → reruns) is deliberately **not** implemented. The result and
-evidence structure is designed to support it later; distributed testing is
-proven first.
+| Scenario | Single machine, STUB | Lab PC, real CARLA | Cross-machine |
+| --- | --- | --- | --- |
+| `connectivity` | PASS | PASS | PASS |
+| `world_state` | PASS | PASS | PASS |
+| `sustained_stream` | PASS | PASS | PASS (19.98 Hz, 34 ms RTT) |
+| `reconnect` | PASS | PASS (real server restart) | not run |
+| `mirror` | SKIPPED | PASS (0 → 6 shadow actors) | not run |
+| `ego_control` | SKIPPED (no real actors) | **not yet run** | not run |
+| `multi_client` | SKIPPED (no real actors) | **not yet run** | not run |
+| `peer_departure` | PASS (event only) | **not yet run** | not run |
+| `udp_bridge` | PASS (5 assertions) | **not yet run** | not run |
+| `camera_follow` | SKIPPED (no local CARLA) | **not yet run** | not run |
+
+So: the first five are proven on real hardware; the five added for role parity
+are implemented and unit-covered, but four of them have never executed against
+a real simulator. Treat those as unverified until they have.
+
+Known environment trap: the interpreter running the lab worker decides whether
+the data server is real or STUB, because it launches `server/server.py` with
+`sys.executable`. With a CARLA-capable interpreter and no simulator listening,
+`server.py` exits rather than falling back to STUB — so use a stub interpreter
+when you deliberately want STUB mode.
+
+Still not implemented, deliberately: an agent autonomously authoring and
+pushing code. Phase 5 only *consumes* commits someone else published.

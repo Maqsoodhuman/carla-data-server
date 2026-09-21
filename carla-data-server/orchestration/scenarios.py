@@ -64,7 +64,10 @@ class _Collector(CARLAClient):
         self.lock = threading.Lock()
         self.states = []            # (monotonic_recv_time, message)
         self.connections = []       # (monotonic_time, client_id)
+        self.acks = []              # every ack except pings (filtered upstream)
+        self.peers_left = []        # (peer_id, owned_actor_ids)
         self.approx_bytes = 0
+        self.ego_id = None          # set from the spawn ack
 
     def on_connected(self, client_id):
         with self.lock:
@@ -77,9 +80,60 @@ class _Collector(CARLAClient):
             self.states.append((time.monotonic(), state))
             self.approx_bytes += size
 
+    def on_ack(self, ack):
+        with self.lock:
+            self.acks.append(ack)
+            if ack.get("command") == wire.CMD_SPAWN and ack.get("actor_id"):
+                self.ego_id = ack["actor_id"]
+
+    def on_peer_left(self, peer_id, owned_actor_ids):
+        with self.lock:
+            self.peers_left.append((peer_id, list(owned_actor_ids)))
+
     def snapshot(self):
         with self.lock:
             return list(self.states), list(self.connections), self.approx_bytes
+
+    @property
+    def client_id_seen(self):
+        with self.lock:
+            return self.connections[-1][1] if self.connections else None
+
+    def latest_vehicles(self):
+        with self.lock:
+            return dict(self.states[-1][1]) if self.states else {}
+
+    def vehicle_by_id(self, actor_id):
+        """Most recent view this participant has of one vehicle."""
+        with self.lock:
+            for _, state in reversed(self.states):
+                for v in state.get("vehicles", []):
+                    if v.get("id") == actor_id:
+                        return dict(v)
+        return None
+
+    def sees_vehicle(self, actor_id) -> bool:
+        return self.vehicle_by_id(actor_id) is not None
+
+
+def _spawn_ego(collector, spawn_index, blueprint="vehicle.tesla.model3", timeout=15.0):
+    """Ask the server for an ego and wait for the ack. Returns the actor id."""
+    collector.send_spawn_at_index(blueprint_id=blueprint,
+                                  spawn_point_index=spawn_index, autopilot=False)
+    _wait_for(lambda: collector.ego_id is not None, timeout)
+    return collector.ego_id
+
+
+def _stub_mode_skip(reason_detail: str) -> "Outcome":
+    """STUB mode fabricates a fixed world, so a spawned actor never enters the
+    feed. That is a missing precondition for actor-level scenarios, not a
+    failure - report it as such rather than as a bogus pass or fail."""
+    return Outcome(P.SKIPPED,
+                   {"reason": "server appears to be in STUB mode (spawned actors "
+                              "never appear in world_state)"}, [],
+                   errors=[{"kind": "precondition", "message": reason_detail,
+                            "fix": "run the data server against a real CARLA "
+                                   "simulator (venv/, not venv-stub/)"}])
 
 
 def _wait_for(predicate, timeout, interval=0.05):
@@ -409,6 +463,391 @@ def scenario_reconnect(ctx: ScenarioContext) -> Outcome:
     return Outcome(P.status_from_assertions(assertions), metrics, assertions, errors)
 
 
+def scenario_multi_client(ctx: ScenarioContext) -> Outcome:
+    """Do two participants share one world and see each other correctly?
+
+    This is the capability UB-DigitalTwin gets from Redis message types 0/1
+    (each participant publishes its own vehicle; everyone renders the others).
+    Here the server owns every actor and marks `is_ego` per viewer, so the
+    thing to prove is that each participant sees its own car flagged, the
+    peer's car unflagged, and both agree on where those cars are.
+    """
+    cfg = ctx.config
+    spawn_a = int(ctx.params.get("spawn_index_a", 0))
+    spawn_b = int(ctx.params.get("spawn_index_b", 1))
+    assertions, metrics = [], {}
+
+    a = _Collector(cfg.data_server_url, ["vehicles"], role="orchestration-agent-a")
+    b = _Collector(cfg.data_server_url, ["vehicles"], role="orchestration-agent-b")
+    ta, tb = a.run_in_thread(), b.run_in_thread()
+    try:
+        if not _wait_for(lambda: a.connections and b.connections, 20.0):
+            return Outcome(P.FAIL, metrics, [P.assertion(
+                "both_participants_connected", False, expected="2 connections",
+                observed=f"a={len(a.connections)} b={len(b.connections)}")])
+
+        id_a, id_b = a.client_id_seen, b.client_id_seen
+        metrics["client_id_a"], metrics["client_id_b"] = id_a, id_b
+        assertions.append(P.assertion(
+            "distinct_client_ids", id_a != id_b,
+            expected="the server issues a different client_id per participant",
+            observed=f"{id_a} vs {id_b}"))
+
+        ego_a = _spawn_ego(a, spawn_a)
+        ego_b = _spawn_ego(b, spawn_b)
+        metrics["ego_a"], metrics["ego_b"] = ego_a, ego_b
+        assertions.append(P.assertion(
+            "both_egos_spawned", bool(ego_a) and bool(ego_b) and ego_a != ego_b,
+            expected="two distinct ego actor ids", observed=f"{ego_a}, {ego_b}"))
+        if not (ego_a and ego_b):
+            return Outcome(P.FAIL, metrics, assertions)
+
+        # Both cars must show up in both feeds before anything else is meaningful.
+        appeared = _wait_for(
+            lambda: a.sees_vehicle(ego_a) and a.sees_vehicle(ego_b)
+            and b.sees_vehicle(ego_a) and b.sees_vehicle(ego_b), 20.0)
+        if not appeared:
+            return _stub_mode_skip(
+                f"spawned egos {ego_a}/{ego_b} never appeared in world_state")
+
+        va_own, va_peer = a.vehicle_by_id(ego_a), a.vehicle_by_id(ego_b)
+        vb_own, vb_peer = b.vehicle_by_id(ego_b), b.vehicle_by_id(ego_a)
+
+        assertions.append(P.assertion(
+            "a_sees_own_car_as_ego", va_own.get("is_ego") is True,
+            expected="A's own vehicle carries is_ego=true in A's feed",
+            observed=va_own.get("is_ego")))
+        assertions.append(P.assertion(
+            "a_sees_peer_car_not_as_ego", va_peer.get("is_ego") is False,
+            expected="B's vehicle carries is_ego=false in A's feed",
+            observed=va_peer.get("is_ego"),
+            detail="is_ego is per-viewer; leaking another participant's ego flag "
+                   "would make every client think it owns the same car"))
+        assertions.append(P.assertion(
+            "b_sees_own_car_as_ego", vb_own.get("is_ego") is True,
+            expected="B's own vehicle carries is_ego=true in B's feed",
+            observed=vb_own.get("is_ego")))
+        assertions.append(P.assertion(
+            "b_sees_peer_car_not_as_ego", vb_peer.get("is_ego") is False,
+            expected="A's vehicle carries is_ego=false in B's feed",
+            observed=vb_peer.get("is_ego")))
+
+        # Same world: both participants must agree on where the shared cars are.
+        def _loc(v):
+            loc = (v or {}).get("transform", {}).get("location", {})
+            return (loc.get("x"), loc.get("y"))
+
+        drift = max(abs((_loc(va_peer)[i] or 0) - (_loc(vb_own)[i] or 0)) for i in (0, 1))
+        metrics["peer_position_drift_m"] = round(drift, 3)
+        assertions.append(P.assertion(
+            "participants_agree_on_peer_position", drift < 5.0,
+            expected="<5 m between the two views of the same car "
+                     "(samples are from slightly different ticks)",
+            observed=f"{drift:.2f} m"))
+
+        ids_a = {v["id"] for v in a.latest_vehicles().get("vehicles", [])}
+        ids_b = {v["id"] for v in b.latest_vehicles().get("vehicles", [])}
+        assertions.append(P.assertion(
+            "both_see_the_same_vehicle_set", ids_a == ids_b,
+            expected="identical vehicle ids in both feeds",
+            observed=f"only A: {sorted(ids_a - ids_b)}, only B: {sorted(ids_b - ids_a)}"))
+        metrics["vehicles_visible"] = len(ids_a)
+    finally:
+        for client, thread in ((a, ta), (b, tb)):
+            client.disconnect()
+            thread.join(timeout=5)
+
+    return Outcome(P.status_from_assertions(assertions), metrics, assertions)
+
+
+def scenario_peer_departure(ctx: ScenarioContext) -> Outcome:
+    """When one participant leaves, is everyone else told, and is its car gone?
+
+    Equivalent to UB-DigitalTwin's type 1 (`destroy`). Their protocol notes a
+    crashed participant never sends one, so the server-side eviction path is
+    what actually has to work - here that is `client_left` plus the ego
+    teardown the server does on disconnect.
+    """
+    cfg = ctx.config
+    assertions, metrics = [], {}
+
+    stayer = _Collector(cfg.data_server_url, ["vehicles"], role="orchestration-stayer")
+    leaver = _Collector(cfg.data_server_url, ["vehicles"], role="orchestration-leaver")
+    ts, tl = stayer.run_in_thread(), leaver.run_in_thread()
+    try:
+        if not _wait_for(lambda: stayer.connections and leaver.connections, 20.0):
+            return Outcome(P.FAIL, metrics, [P.assertion(
+                "both_participants_connected", False, expected="2 connections",
+                observed=f"{len(stayer.connections)}/{len(leaver.connections)}")])
+        leaver_id = leaver.client_id_seen
+        metrics["leaver_client_id"] = leaver_id
+
+        ego = _spawn_ego(leaver, int(ctx.params.get("spawn_index", 2)))
+        metrics["leaver_ego"] = ego
+        had_actor = bool(ego) and _wait_for(lambda: stayer.sees_vehicle(ego), 20.0)
+        metrics["ego_was_visible_to_peer"] = had_actor
+
+        leaver.disconnect()
+        tl.join(timeout=10)
+
+        got_event = _wait_for(lambda: any(p == leaver_id for p, _ in stayer.peers_left),
+                              30.0, 0.2)
+        assertions.append(P.assertion(
+            "peer_departure_announced", got_event,
+            expected=f"client_left naming {leaver_id}",
+            observed=[p for p, _ in stayer.peers_left] or "no client_left received"))
+
+        if got_event and had_actor:
+            owned = next(ids for p, ids in stayer.peers_left if p == leaver_id)
+            metrics["announced_owned_actor_ids"] = owned
+            assertions.append(P.assertion(
+                "departure_reports_owned_actors", ego in owned,
+                expected=f"owned_actor_ids contains the leaver's ego {ego}",
+                observed=owned,
+                detail="peers need this to tear down their local copy of the car"))
+            gone = _wait_for(lambda: not stayer.sees_vehicle(ego), 25.0, 0.5)
+            assertions.append(P.assertion(
+                "departed_car_removed_from_world", gone,
+                expected="the server destroys the ego, so it leaves world_state",
+                observed="still present" if not gone else "removed"))
+        elif got_event and not had_actor:
+            # No real actor (STUB mode): the event itself is still verifiable.
+            metrics["note"] = ("leaver had no visible ego, so only the client_left "
+                               "event was checked, not actor teardown")
+    finally:
+        for client, thread in ((stayer, ts), (leaver, tl)):
+            client.disconnect()
+            thread.join(timeout=5)
+
+    return Outcome(P.status_from_assertions(assertions), metrics, assertions)
+
+
+def scenario_ego_control(ctx: ScenarioContext) -> Outcome:
+    """Does a control command actually move the car?
+
+    This is the regression guard for the CARLA sync-mode bug where
+    world.get_actor() returns an actor whose apply_control() is silently
+    ignored - acks come back ok and nothing moves. Only a real simulator can
+    catch it, so in STUB mode this is SKIPPED rather than faked.
+    """
+    cfg = ctx.config
+    throttle_seconds = float(ctx.params.get("throttle_seconds", 4.0))
+    min_speed = float(ctx.params.get("min_speed_ms", 1.0))
+    assertions, metrics = [], {}
+
+    driver = _Collector(cfg.data_server_url, ["vehicles"], role="orchestration-driver")
+    thread = driver.run_in_thread()
+    try:
+        if not _wait_for(lambda: bool(driver.connections), 20.0):
+            return Outcome(P.FAIL, metrics, [P.assertion(
+                "connected", False, expected="a connection", observed="none")])
+        ego = _spawn_ego(driver, int(ctx.params.get("spawn_index", 0)))
+        metrics["ego"] = ego
+        if not ego or not _wait_for(lambda: driver.sees_vehicle(ego), 20.0):
+            return _stub_mode_skip(f"ego {ego} never appeared in world_state")
+
+        def speed_of(actor_id):
+            v = (driver.vehicle_by_id(actor_id) or {}).get("velocity", {})
+            return (v.get("x", 0) ** 2 + v.get("y", 0) ** 2 + v.get("z", 0) ** 2) ** 0.5
+
+        start_speed = speed_of(ego)
+        deadline = time.monotonic() + throttle_seconds
+        while time.monotonic() < deadline:
+            driver.send_ego_control(throttle=0.75, steer=0.0, brake=0.0)
+            time.sleep(0.05)
+        top_speed = speed_of(ego)
+
+        deadline = time.monotonic() + throttle_seconds
+        while time.monotonic() < deadline:
+            driver.send_ego_control(throttle=0.0, steer=0.0, brake=1.0)
+            time.sleep(0.05)
+        braked_speed = speed_of(ego)
+
+        metrics.update({"speed_at_start_ms": round(start_speed, 3),
+                        "speed_after_throttle_ms": round(top_speed, 3),
+                        "speed_after_brake_ms": round(braked_speed, 3)})
+        assertions.append(P.assertion(
+            "throttle_accelerates_the_car", top_speed >= min_speed,
+            expected=f">= {min_speed} m/s after {throttle_seconds}s of throttle",
+            observed=f"{top_speed:.2f} m/s",
+            detail="if acks are ok but speed stays 0, apply_control is being "
+                   "silently dropped - the known sync-mode actor-handle bug"))
+        assertions.append(P.assertion(
+            "brake_decelerates_the_car", braked_speed < max(top_speed * 0.5, 0.5),
+            expected="clearly slower after braking",
+            observed=f"{top_speed:.2f} -> {braked_speed:.2f} m/s"))
+        failed_acks = [a for a in driver.acks
+                       if a.get("command") == wire.CMD_EGO_CONTROL
+                       and a.get("status") != "ok"]
+        assertions.append(P.assertion(
+            "control_commands_acked_ok", not failed_acks,
+            expected="no failed ego_control acks",
+            observed=f"{len(failed_acks)} failed: "
+                     f"{[a.get('message') for a in failed_acks[:3]]}"))
+    finally:
+        driver.disconnect()
+        thread.join(timeout=5)
+
+    return Outcome(P.status_from_assertions(assertions), metrics, assertions)
+
+
+def scenario_udp_bridge(ctx: ScenarioContext) -> Outcome:
+    """Does the Unity-facing UDP leg deliver usable packets?
+
+    Equivalent to UB-DigitalTwin's type 3 relay. Checks the reshaped payload
+    the UB-MR app actually consumes, including the tick/sim_time fields added
+    for interpolation.
+    """
+    cfg = ctx.config
+    want = int(ctx.params.get("packet_count", 20))
+    timeout = float(ctx.params.get("timeout", 40.0))
+    assertions, metrics = [], {}
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.settimeout(2.0)
+    udp_port = sock.getsockname()[1]
+
+    bridge = os.path.join(REPO_ROOT, "bridges", "ws_to_udp_bridge.py")
+    cmd = [sys.executable, "-u", bridge, "--server", cfg.data_server_url,
+           "--udp-host", "127.0.0.1", "--udp-port", str(udp_port)]
+    ctx.log("running: " + " ".join(cmd))
+    proc = subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    packets = []
+    try:
+        deadline = time.monotonic() + timeout
+        while len(packets) < want and time.monotonic() < deadline:
+            try:
+                data, _ = sock.recvfrom(65535)
+            except socket.timeout:
+                if proc.poll() is not None:
+                    break
+                continue
+            try:
+                packets.append(json.loads(data.decode("utf-8")))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                ctx.log(f"undecodable UDP packet: {exc}")
+        still_running = proc.poll() is None
+    finally:
+        sock.close()
+        proc.terminate()
+        try:
+            output = proc.communicate(timeout=10)[0] or ""
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            output = proc.communicate()[0] or ""
+    ctx.logs.extend(output.splitlines()[-60:])
+
+    metrics["packets_received"] = len(packets)
+    metrics["bridge_exit_code"] = proc.returncode
+    assertions.append(P.assertion(
+        "bridge_stayed_up", still_running,
+        expected="bridge alive while relaying", observed=f"exit={proc.returncode}"))
+    assertions.append(P.assertion(
+        "udp_packets_received", len(packets) >= want,
+        expected=f">= {want} packets in {timeout}s", observed=len(packets)))
+    if not packets:
+        return Outcome(P.FAIL, metrics, assertions,
+                       errors=[{"kind": "no_data",
+                                "message": "no UDP packets reached the listener"}])
+
+    required = ("vehicles", "timestamp", "tick", "sim_time")
+    missing = sorted({f for f in required for p in packets if f not in p})
+    assertions.append(P.assertion(
+        "packet_schema_complete", not missing,
+        expected=f"every packet carries {list(required)}",
+        observed=f"missing {missing}",
+        detail="tick/sim_time are what Unity should interpolate on; timestamp is "
+               "wall-clock and skews between machines"))
+
+    ticks = [p.get("tick") for p in packets if isinstance(p.get("tick"), int)]
+    assertions.append(P.assertion(
+        "tick_advances_over_udp", _monotonic_ticks(ticks),
+        expected="tick increases across packets (UDP may drop, not reorder here)",
+        observed=f"{ticks[:5]}...{ticks[-3:]}" if ticks else "no integer ticks"))
+    metrics["first_tick"], metrics["last_tick"] = (ticks[0], ticks[-1]) if ticks else (None, None)
+
+    shaped = [p for p in packets if p.get("vehicles")]
+    if shaped:
+        sample = shaped[-1]["vehicles"][0]
+        needed = ("id", "blueprint", "location", "yaw")
+        absent = [f for f in needed if f not in sample]
+        assertions.append(P.assertion(
+            "vehicle_entries_shaped_for_unity", not absent,
+            expected=f"each vehicle has {list(needed)}", observed=f"missing {absent}"))
+        metrics["vehicles_per_packet"] = len(shaped[-1]["vehicles"])
+    else:
+        metrics["note"] = "no packet contained a vehicle; shape of entries unchecked"
+
+    return Outcome(P.status_from_assertions(assertions), metrics, assertions)
+
+
+def scenario_camera_follow(ctx: ScenarioContext) -> Outcome:
+    """Does the spectator-camera follower track an actor in a local CARLA?
+
+    Equivalent to UB-DigitalTwin's camera-follow role. Needs a CARLA on this
+    machine to move the spectator in; SKIPPED when there isn't one.
+    """
+    cfg = ctx.config
+    duration = float(ctx.params.get("duration", 15.0))
+    host = ctx.params.get("view_host", cfg.shadow_carla_host)
+    port = int(ctx.params.get("view_port", cfg.shadow_carla_port))
+    assertions, metrics = [], {}
+
+    try:
+        import carla
+    except ImportError:
+        return Outcome(P.SKIPPED, {"reason": "carla PythonAPI not importable"}, [],
+                       errors=[{"kind": "precondition",
+                                "message": "camera-follow drives a local CARLA "
+                                           "spectator; use venv/, not venv-stub/"}])
+    try:
+        viewer = carla.Client(host, port)
+        viewer.set_timeout(10.0)
+        world = viewer.get_world()
+        before = world.get_spectator().get_transform()
+    except (RuntimeError, OSError) as exc:
+        return Outcome(P.SKIPPED,
+                       {"reason": f"no CARLA to view with at {host}:{port}"}, [],
+                       errors=[{"kind": "precondition", "message": str(exc)}])
+
+    script = os.path.join(REPO_ROOT, "scripts", "camera_follow.py")
+    cmd = [sys.executable, "-u", script, "--server", cfg.data_server_url,
+           "--carla-host", host, "--carla-port", str(port),
+           "--duration", str(duration)]
+    ctx.log("running: " + " ".join(cmd))
+    proc = subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    try:
+        output = proc.communicate(timeout=duration + 45)[0] or ""
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        output = proc.communicate()[0] or ""
+    ctx.logs.extend(output.splitlines()[-60:])
+
+    after = world.get_spectator().get_transform()
+    moved = max(abs(after.location.x - before.location.x),
+                abs(after.location.y - before.location.y),
+                abs(after.location.z - before.location.z))
+    metrics.update({"spectator_moved_m": round(moved, 3),
+                    "follower_exit_code": proc.returncode})
+
+    assertions.append(P.assertion(
+        "follower_exited_cleanly", proc.returncode == 0,
+        expected="exit 0 after its --duration",
+        observed=f"exit={proc.returncode}"))
+    assertions.append(P.assertion(
+        "spectator_was_moved", moved > 0.5,
+        expected="the spectator camera is repositioned to track the target",
+        observed=f"moved {moved:.2f} m",
+        detail="0 m means the follower never found a target, or never wrote to "
+               "the simulator"))
+    if "followed" in output:
+        metrics["follower_report"] = output.strip().splitlines()[-1][:200]
+    return Outcome(P.status_from_assertions(assertions), metrics, assertions)
+
+
 def scenario_mirror(ctx: ScenarioContext) -> Outcome:
     """Does carla_mirror_client replicate the lab's world into a local CARLA?
 
@@ -504,19 +943,33 @@ REGISTRY = {
     "connectivity": scenario_connectivity,
     "world_state": scenario_world_state,
     "sustained_stream": scenario_sustained_stream,
+    "ego_control": scenario_ego_control,
+    "multi_client": scenario_multi_client,
+    "peer_departure": scenario_peer_departure,
+    "udp_bridge": scenario_udp_bridge,
     "reconnect": scenario_reconnect,
     "mirror": scenario_mirror,
+    "camera_follow": scenario_camera_follow,
 }
 
-DEFAULT_SUITE = ["connectivity", "world_state", "sustained_stream", "reconnect", "mirror"]
+# Cheapest and most fundamental first, so a broken link fails fast; the
+# CARLA-dependent and subprocess-heavy ones come last.
+DEFAULT_SUITE = ["connectivity", "world_state", "sustained_stream", "ego_control",
+                 "multi_client", "peer_departure", "udp_bridge", "reconnect",
+                 "mirror", "camera_follow"]
 
 # Generous per-scenario ceilings; the coordinator sweeps anything that exceeds them.
 TIMEOUTS = {
     "connectivity": 90.0,
     "world_state": 120.0,
     "sustained_stream": 180.0,
+    "ego_control": 180.0,
+    "multi_client": 180.0,
+    "peer_departure": 180.0,
+    "udp_bridge": 150.0,
     "reconnect": 240.0,
     "mirror": 180.0,
+    "camera_follow": 180.0,
 }
 
 

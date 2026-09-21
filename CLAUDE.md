@@ -54,6 +54,21 @@ python bridges/ws_to_udp_bridge.py --server ws://<host>:8765 \
                                    --udp-host localhost --udp-port 12345
 ```
 
+Follow an actor with a local CARLA's spectator camera (often a shadow sim):
+```
+python scripts/camera_follow.py --server ws://localhost:8765 \
+                                --carla-host localhost --carla-port 2003
+```
+
+Two-machine automated test suite (LAB runs CARLA + server + coordinator,
+CLIENT connects and executes scenarios) — see `docs/two-machine-testing.md`:
+```
+# on the LAB machine
+python -m orchestration lab --keep-alive
+# on the CLIENT machine
+LAB_HOST=<lab-ip> python -m orchestration client
+```
+
 
 ## Architecture
 
@@ -67,6 +82,8 @@ The server is a hybrid threaded + asyncio process. Understanding which thread ow
 `--traffic-rate-divisor N` (default 1, unchanged behavior) refreshes `pedestrians`/`traffic_lights` only every Nth tick in `TickLoopThread`, reusing the last computed lists on skipped ticks; `vehicles` always refreshes every tick, since a viewing client's own ego lives in that list too. See `docs/wire-protocol.md` for the tradeoffs.
 
 Cross-thread queues (`queue.Queue` for command/broadcast, `asyncio.Queue` for send/peer-event) are the ONLY communication path. Every `asyncio.Queue` is bounded and drops-oldest on overflow (`_enqueue_drop_oldest`) — do not remove this behavior; a slow client must not stall the tick loop.
+
+`orchestration/` is a separate layer on top, not part of the server: a coordinator (stdlib HTTP, run state machine, agent mailbox) plus LAB and CLIENT workers that drive the scenarios in `orchestration/scenarios.py` across two machines. It only ever talks to the server through the documented wire protocol, the same as any other client.
 
 ## Wire protocol
 
