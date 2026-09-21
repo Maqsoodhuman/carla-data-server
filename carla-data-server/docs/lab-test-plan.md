@@ -60,10 +60,13 @@ All commands run from `~/Documents/carla-data-server/carla-data-server` with
   the "Publish-rate contract" section of `docs/wire-protocol.md`.
 
 - [ ] **4. Two-CARLA mirroring, entirely local.** Start a second CARLA
-  instance on the Lab PC on port 2001, then:
+  instance on the Lab PC with `-carla-rpc-port=2003` — **not 2001**: CARLA
+  binds `rpc_port`, `+1` and `+2`, so 2001/2002 already belong to the
+  primary simulator on 2000 (a TCP probe of 2001 succeeds and looks like a
+  second simulator, but RPC calls time out). Then:
   ```
   python bridges/carla_mirror_client.py --server ws://localhost:8765 \
-                                        --shadow-host localhost --shadow-port 2001
+                                        --shadow-host localhost --shadow-port 2003
   ```
   Confirms vehicle/pedestrian spawn-teleport-despawn logic and traffic-light
   index-matching against two *real* CARLA worlds. Also restart the server with

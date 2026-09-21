@@ -426,24 +426,40 @@ def scenario_mirror(ctx: ScenarioContext) -> Outcome:
                        errors=[{"kind": "precondition",
                                 "message": "mirror needs the CARLA PythonAPI on the client "
                                            "machine (use venv/, not venv-stub/)"}])
+    endpoint = f"{cfg.shadow_carla_host}:{cfg.shadow_carla_port}"
     try:
         with socket.create_connection((cfg.shadow_carla_host, cfg.shadow_carla_port), timeout=5):
             pass
     except OSError as exc:
-        return Outcome(P.SKIPPED,
-                       {"reason": f"shadow CARLA unreachable at "
-                                  f"{cfg.shadow_carla_host}:{cfg.shadow_carla_port}"}, [],
+        return Outcome(P.SKIPPED, {"reason": f"nothing listening at {endpoint}"}, [],
                        errors=[{"kind": "precondition", "message": str(exc)}])
 
+    # A TCP probe is NOT proof of a shadow simulator: CARLA also binds
+    # rpc_port+1 and +2 for streaming, so with CARLA on 2000 a probe of 2001
+    # connects to the *primary* simulator's streaming port and looks healthy.
+    # Only an RPC handshake settles it - and failing it means "no shadow
+    # available" (SKIPPED), not "the test broke" (ERROR).
     import carla
     shadow = carla.Client(cfg.shadow_carla_host, cfg.shadow_carla_port)
-    shadow.set_timeout(10.0)
-    world = shadow.get_world()
+    shadow.set_timeout(float(ctx.params.get("shadow_timeout", 10.0)))
+    try:
+        world = shadow.get_world()
+        shadow_map = world.get_map().name
+    except RuntimeError as exc:
+        return Outcome(
+            P.SKIPPED,
+            {"reason": f"no CARLA RPC endpoint at {endpoint}",
+             "hint": "a plain TCP connect can succeed against the primary "
+                     "simulator's streaming port (rpc_port+1)"}, [],
+            errors=[{"kind": "precondition",
+                     "message": f"{endpoint} accepted TCP but is not a CARLA RPC "
+                                f"endpoint: {exc}",
+                     "fix": "start a second simulator with a non-colliding port, e.g. "
+                            "-carla-rpc-port=2003, and set SHADOW_CARLA_PORT to match"}])
     before = len(world.get_actors().filter("vehicle.*"))
 
     # carla_mirror_client pairs traffic lights by index, so a shadow running a
     # different map mirrors onto the wrong layout instead of failing outright.
-    shadow_map = world.get_map().name
     metrics["shadow_map"] = shadow_map
     metrics["required_map"] = cfg.carla_map
     assertions.append(P.assertion(
