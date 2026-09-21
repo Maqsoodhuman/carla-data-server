@@ -20,7 +20,7 @@ Two virtualenvs live alongside the source:
 - `venv/` — full environment with the CARLA 0.9.16 PythonAPI installed. Use this on machines that talk to a real CARLA simulator.
 - `venv-stub/` — minimal environment (just `websockets`). Use this for pure server-development work; `server.py` auto-detects the missing `carla` module and drops into STUB mode (synthetic vehicles/pedestrians/traffic lights) so the whole pipeline is exercisable without CARLA.
 
-There is no git repo, no test suite, no CI. Runtime testing is done by starting the server and connecting a client.
+There is no CI. `tests/` holds a small `pytest` suite (`pip install pytest`, then `pytest tests/` from `carla-data-server/carla-data-server/`) covering pure logic that needs no live server or CARLA: `client/wire.py`, `SensorBuffer`'s dirty-tracking, `BroadcastThread._filter`'s per-client isolation, `_enqueue_drop_oldest`'s backpressure semantics, and a static scan (`test_protocol_conformance.py`) that fails if any file hardcodes a message-type/command string literal instead of importing the matching `wire.MSG_*`/`wire.CMD_*` constant. Everything else (live WebSocket behavior, CARLA-dependent paths, multi-client/multi-machine scenarios) is still tested manually by starting the server and connecting a client.
 
 ## Common commands
 
@@ -62,7 +62,9 @@ The server is a hybrid threaded + asyncio process. Understanding which thread ow
 - **TickLoopThread** (thread) — the only writer to CARLA. Each tick it drains `command_queue`, calls `world.tick()`, snapshots actor state, and pushes the snapshot onto `broadcast_queue`. All CARLA PythonAPI calls happen here or on sensor callbacks; `CarlaConnection._lock` serializes them.
 - **BroadcastThread** (thread) — pops snapshots off `broadcast_queue`, filters per-client based on `session.subscriptions` and `ego_actor_id` (setting `is_ego`), caches the JSON encoding per unique (subs, ego) key, and dispatches into each session's `send_queue` via `asyncio.run_coroutine_threadsafe`.
 - **asyncio loop** (main thread) — `websockets.serve` per-connection handler, plus `janitor` (evicts clients whose `last_seen` exceeds `silence_timeout`) and `peer_event_fanout` (broadcasts `client_left` events).
-- **SensorBuffer** (shared) — CARLA sensor `listen()` callbacks fire on background threads; they write into `SensorBuffer._latest`, which the tick loop drains into the snapshot. Camera frames are JPEG-encoded (BGRA→BGR→RGB via PIL) at quality 60 before hitting the buffer; the broadcast filter base64-encodes them for JSON transport.
+- **SensorBuffer** (shared) — CARLA sensor `listen()` callbacks fire on background threads; they write into `SensorBuffer._latest`, which the tick loop drains into the snapshot. Camera frames are JPEG-encoded (BGRA→BGR→RGB via PIL) at quality 60 before hitting the buffer; the broadcast filter base64-encodes them for JSON transport. `drain()` returns only sensors with a frame newer than the last drain (dirty-tracked) — a tick with no fresh camera frame sends no stale JPEG at all.
+
+`--traffic-rate-divisor N` (default 1, unchanged behavior) refreshes `pedestrians`/`traffic_lights` only every Nth tick in `TickLoopThread`, reusing the last computed lists on skipped ticks; `vehicles` always refreshes every tick, since a viewing client's own ego lives in that list too. See `docs/wire-protocol.md` for the tradeoffs.
 
 Cross-thread queues (`queue.Queue` for command/broadcast, `asyncio.Queue` for send/peer-event) are the ONLY communication path. Every `asyncio.Queue` is bounded and drops-oldest on overflow (`_enqueue_drop_oldest`) — do not remove this behavior; a slow client must not stall the tick loop.
 
@@ -70,8 +72,10 @@ Cross-thread queues (`queue.Queue` for command/broadcast, `asyncio.Queue` for se
 
 All frames are JSON objects with a `"type"` field over WebSocket. JSON is the only wire format. `proto/world_state.proto` is kept as a schema sketch for a possible binary format later; nothing reads it, and there is no encoder — the `serializer.py` swap-in module and its generated bindings were removed as dead code. If you revive protobuf, regenerate with `protoc --python_out=server proto/world_state.proto` and write the encoder then.
 
+`client/wire.py` is the single source of truth for message-type strings, `VALID_TOPICS`/`VALID_COMMANDS`, and shared helpers (`parse_frame`, `validate_message`, `make_subscribe`, `make_ping`) — `server.py`, `client.py`, and every raw-`websockets` bridge/script import from it rather than hardcoding literals. Full contract (message shapes, the `tick`/`timestamp`/`wall_time` interpolation contract, rate-tiering, consumer/publisher rules): `docs/wire-protocol.md`. Per-process role table (who subscribes to what, who sends commands, at what rate): `docs/telemetry-roles.md`.
+
 Server → client message types: `welcome`, `world_state`, `ack`, `client_left`.
-Client → server command types (see `VALID_COMMANDS` in `server.py`): `ego_control`, `spawn`, `destroy`, `subscribe`, `list_spawn_points`, `ping`, `spawn_sensor`.
+Client → server command types: `ego_control`, `spawn`, `destroy`, `subscribe`, `list_spawn_points`, `ping`, `spawn_sensor`.
 
 `list_spawn_points` and `ping` piggy-back their response payload as a JSON string inside the `ack.message` field — this is intentional; the ack channel is the reply channel for RPC-shaped commands.
 

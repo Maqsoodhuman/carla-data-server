@@ -35,6 +35,7 @@ import pygame
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "client"))
 from client import CARLAClient
+import wire
 
 import websockets
 import websockets.exceptions
@@ -96,7 +97,7 @@ class InteractiveDriver(CARLAClient):
             payload["transform"] = transform
         if attributes:
             payload["attributes"] = attributes
-        self._enqueue({"type": "spawn_sensor", "payload": payload})
+        self._enqueue({"type": wire.CMD_SPAWN_SENSOR, "payload": payload})
 
     def on_connected(self, client_id):
         super().on_connected(client_id)

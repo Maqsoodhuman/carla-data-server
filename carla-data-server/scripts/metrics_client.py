@@ -19,11 +19,16 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+import sys
 import time
 import statistics
 
 import websockets
 import websockets.exceptions
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "client"))
+import wire  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -179,10 +184,9 @@ async def run_metrics(server_url):
                 log.info("Connected as %s", welcome.get("client_id", "unknown"))
 
                 # Subscribe to everything
-                await ws.send(json.dumps({
-                    "type": "subscribe",
-                    "payload": {"topics": ["vehicles", "pedestrians", "traffic_lights", "sensors"]}
-                }))
+                await ws.send(json.dumps(
+                    wire.make_subscribe(["vehicles", "pedestrians", "traffic_lights", "sensors"])
+                ))
 
                 # Keep-alive: send a ping every 3 seconds so the server's
                 # silence-timeout janitor doesn't evict us
@@ -190,10 +194,7 @@ async def run_metrics(server_url):
                     while True:
                         await asyncio.sleep(3)
                         try:
-                            await ws.send(json.dumps({
-                                "type": "ping",
-                                "payload": {"client_ts": time.time()}
-                            }))
+                            await ws.send(json.dumps(wire.make_ping(time.time())))
                         except Exception:
                             return
 
@@ -202,14 +203,13 @@ async def run_metrics(server_url):
                 try:
                     # Consume messages
                     async for raw in ws:
-                        try:
-                            msg = json.loads(raw)
-                        except json.JSONDecodeError:
+                        msg = wire.parse_frame(raw)
+                        if msg is None or not wire.validate_message(msg):
                             continue
 
                         msg_type = msg.get("type")
 
-                        if msg_type == "world_state":
+                        if msg_type == wire.MSG_WORLD_STATE:
                             collector.record(raw, msg)
                         # Silently ignore acks, pong, welcome, etc.
                 finally:

@@ -49,8 +49,10 @@ import asyncio
 import json
 import logging
 import math
+import os
 import queue
 import signal
+import sys
 import threading
 import time
 import uuid
@@ -59,6 +61,11 @@ from typing import Dict, List, Optional, Set
 
 import websockets
 from websockets.server import WebSocketServerProtocol
+
+# Shared wire-protocol registry (type strings, topic/command sets) - lives in
+# the sibling client/ directory alongside client.py. See docs/wire-protocol.md.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "client"))
+import wire  # noqa: E402
 
 # CARLA import (graceful stub if not installed)
 try:
@@ -75,14 +82,9 @@ log = logging.getLogger("carla-server")
 if not CARLA_AVAILABLE:
     log.warning("CARLA PythonAPI not found - running in STUB mode")
 
-VALID_TOPICS = {"vehicles", "pedestrians", "traffic_lights", "sensors"}
-VALID_COMMANDS = {
-    "ego_control", "spawn", "destroy", "subscribe",
-    "list_spawn_points", "ping", "spawn_sensor",
-}
-
 # Defaults (overridable via CLI)
 DEFAULT_SILENCE_TIMEOUT = 5.0   # seconds without inbound traffic before eviction
+DEFAULT_TRAFFIC_RATE_DIVISOR = 1  # refresh pedestrians/traffic_lights every Nth tick
 JANITOR_INTERVAL = 1.0          # how often the janitor scans
 CLIENT_QUEUE_MAX = 10
 
@@ -95,7 +97,7 @@ CLIENT_QUEUE_MAX = 10
 class ClientSession:
     id: str
     ws: WebSocketServerProtocol
-    subscriptions: Set[str] = field(default_factory=lambda: set(VALID_TOPICS))
+    subscriptions: Set[str] = field(default_factory=lambda: set(wire.VALID_TOPICS))
     send_queue: asyncio.Queue = None
     ego_actor_id: Optional[int] = None
     role: str = "spectator"
@@ -119,18 +121,26 @@ class SensorBuffer:
     def __init__(self):
         self._lock = threading.Lock()
         self._latest: Dict[int, dict] = {}
+        self._dirty: Set[int] = set()
 
     def update(self, sensor_id: int, frame: dict):
         with self._lock:
             self._latest[sensor_id] = frame
+            self._dirty.add(sensor_id)
 
     def drain(self) -> List[dict]:
+        """Return only sensors with a frame that arrived since the last
+        drain, instead of every active sensor's last-known frame - a tick
+        with no fresh camera frame sends no stale JPEG at all."""
         with self._lock:
-            return list(self._latest.values())
+            out = [self._latest[sid] for sid in self._dirty if sid in self._latest]
+            self._dirty.clear()
+            return out
 
     def remove(self, sensor_id: int):
         with self._lock:
             self._latest.pop(sensor_id, None)
+            self._dirty.discard(sensor_id)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -224,7 +234,12 @@ class CarlaConnection:
         with self._lock:
             self.world.tick()
 
-    def snapshot(self, tick: int, timestamp: float) -> dict:
+    def snapshot(self, tick: int, timestamp: float, refresh_traffic: bool = True) -> dict:
+        """Build one world_state snapshot. When refresh_traffic is False,
+        pedestrians and traffic_lights are skipped entirely (including their
+        actor.get_transform()/get_velocity()/get_state() calls) - the caller
+        (TickLoopThread) is expected to reuse its last cached copy of those
+        two lists. Vehicles are always refreshed every tick regardless."""
         if not CARLA_AVAILABLE:
             return _stub_world_state(tick, timestamp)
 
@@ -233,13 +248,12 @@ class CarlaConnection:
             vehicles, pedestrians, traffic_lights = [], [], []
 
             for actor in actors:
-                t = actor.get_transform()
-                transform = {
-                    "location": {"x": t.location.x, "y": t.location.y, "z": t.location.z},
-                    "rotation": {"pitch": t.rotation.pitch, "yaw": t.rotation.yaw, "roll": t.rotation.roll},
-                }
-
                 if actor.type_id.startswith("vehicle."):
+                    t = actor.get_transform()
+                    transform = {
+                        "location": {"x": t.location.x, "y": t.location.y, "z": t.location.z},
+                        "rotation": {"pitch": t.rotation.pitch, "yaw": t.rotation.yaw, "roll": t.rotation.roll},
+                    }
                     v = actor.get_velocity()
                     av = actor.get_angular_velocity()
                     vehicles.append({
@@ -250,7 +264,12 @@ class CarlaConnection:
                         "angular_vel": {"x": av.x, "y": av.y, "z": av.z},
                         "is_ego": False,
                     })
-                elif actor.type_id.startswith("walker."):
+                elif refresh_traffic and actor.type_id.startswith("walker."):
+                    t = actor.get_transform()
+                    transform = {
+                        "location": {"x": t.location.x, "y": t.location.y, "z": t.location.z},
+                        "rotation": {"pitch": t.rotation.pitch, "yaw": t.rotation.yaw, "roll": t.rotation.roll},
+                    }
                     v = actor.get_velocity()
                     pedestrians.append({
                         "id": actor.id,
@@ -258,7 +277,12 @@ class CarlaConnection:
                         "transform": transform,
                         "velocity": {"x": v.x, "y": v.y, "z": v.z},
                     })
-                elif actor.type_id.startswith("traffic.traffic_light"):
+                elif refresh_traffic and actor.type_id.startswith("traffic.traffic_light"):
+                    t = actor.get_transform()
+                    transform = {
+                        "location": {"x": t.location.x, "y": t.location.y, "z": t.location.z},
+                        "rotation": {"pitch": t.rotation.pitch, "yaw": t.rotation.yaw, "roll": t.rotation.roll},
+                    }
                     state_map = {
                         carla.TrafficLightState.Red:    "Red",
                         carla.TrafficLightState.Yellow: "Yellow",
@@ -275,7 +299,7 @@ class CarlaConnection:
         sensors = self.sensor_buffer.drain()
 
         return {
-            "type": "world_state",
+            "type": wire.MSG_WORLD_STATE,
             "tick": tick,
             "timestamp": timestamp,
             "wall_time": time.time(),
@@ -441,7 +465,7 @@ class CarlaConnection:
 def _stub_world_state(tick: int, timestamp: float) -> dict:
     t = timestamp
     return {
-        "type": "world_state",
+        "type": wire.MSG_WORLD_STATE,
         "tick": tick,
         "timestamp": timestamp,
         "wall_time": time.time(),
@@ -506,14 +530,17 @@ class ServerState:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TickLoopThread(threading.Thread):
-    def __init__(self, carla_conn: CarlaConnection, state: ServerState, tick_rate: float):
+    def __init__(self, carla_conn: CarlaConnection, state: ServerState, tick_rate: float,
+                 traffic_rate_divisor: int = DEFAULT_TRAFFIC_RATE_DIVISOR):
         super().__init__(name="TickLoop", daemon=True)
         self.carla = carla_conn
         self.state = state
         self.tick_rate = tick_rate
         self.tick_interval = 1.0 / tick_rate
+        self.traffic_rate_divisor = max(1, traffic_rate_divisor)
         self._tick = 0
         self._sim_time = 0.0
+        self._cached_traffic = {"pedestrians": [], "traffic_lights": []}
 
     def run(self):
         log.info("TickLoop started at %.1f Hz", self.tick_rate)
@@ -539,7 +566,16 @@ class TickLoopThread(threading.Thread):
                 self._tick += 1
                 self._sim_time += self.tick_interval
 
-                world_state = self.carla.snapshot(self._tick, self._sim_time)
+                refresh_traffic = (self._tick % self.traffic_rate_divisor == 0)
+                world_state = self.carla.snapshot(self._tick, self._sim_time, refresh_traffic)
+                if refresh_traffic:
+                    self._cached_traffic = {
+                        "pedestrians": world_state["pedestrians"],
+                        "traffic_lights": world_state["traffic_lights"],
+                    }
+                else:
+                    world_state["pedestrians"] = self._cached_traffic["pedestrians"]
+                    world_state["traffic_lights"] = self._cached_traffic["traffic_lights"]
 
                 try:
                     self.state.broadcast_queue.put_nowait(world_state)
@@ -570,7 +606,7 @@ class TickLoopThread(threading.Thread):
             except queue.Empty:
                 break
 
-            ack = {"type": "ack", "client_id": cmd.client_id,
+            ack = {"type": wire.MSG_ACK, "client_id": cmd.client_id,
                    "command": cmd.type,
                    "status": "ok", "message": "", "actor_id": 0}
 
@@ -643,9 +679,9 @@ class TickLoopThread(threading.Thread):
                 ack.update({"status": "failed", "message": f"actor {actor_id} not found"})
 
         elif cmd.type == "subscribe":
-            topics = set(cmd.payload.get("topics", list(VALID_TOPICS)))
-            invalid = topics - VALID_TOPICS
-            topics &= VALID_TOPICS
+            topics = set(cmd.payload.get("topics", list(wire.VALID_TOPICS)))
+            invalid = topics - wire.VALID_TOPICS
+            topics &= wire.VALID_TOPICS
             with self.state.clients_lock:
                 session = self.state.clients.get(cmd.client_id)
                 if session:
@@ -811,10 +847,10 @@ async def handle_client(ws: WebSocketServerProtocol, state: ServerState,
     log.info("Client connected: %s from %s", client_id, ws.remote_address)
 
     await ws.send(json.dumps({
-        "type": "welcome",
+        "type": wire.MSG_WELCOME,
         "client_id": client_id,
-        "valid_topics": sorted(VALID_TOPICS),
-        "valid_commands": sorted(VALID_COMMANDS),
+        "valid_topics": sorted(wire.VALID_TOPICS),
+        "valid_commands": sorted(wire.VALID_COMMANDS),
         "silence_timeout": state.silence_timeout,
     }))
 
@@ -838,7 +874,7 @@ async def handle_client(ws: WebSocketServerProtocol, state: ServerState,
                     log.warning("Invalid JSON from client %s", client_id)
                     continue
                 cmd_type = msg.get("type")
-                if cmd_type not in VALID_COMMANDS:
+                if cmd_type not in wire.VALID_COMMANDS:
                     log.warning("Unknown command from %s: %s", client_id, cmd_type)
                     continue
                 state.command_queue.put(Command(
@@ -888,7 +924,7 @@ async def handle_client(ws: WebSocketServerProtocol, state: ServerState,
         if state.peer_event_queue is not None:
             try:
                 state.peer_event_queue.put_nowait({
-                    "type": "client_left",
+                    "type": wire.MSG_CLIENT_LEFT,
                     "client_id": client_id,
                     "owned_actor_ids": owned_actor_ids,
                     "wall_time": time.time(),
@@ -1025,6 +1061,11 @@ def main():
     parser.add_argument("--silence-timeout", type=float,
                         default=DEFAULT_SILENCE_TIMEOUT,
                         help="Seconds without inbound traffic before evicting a client")
+    parser.add_argument("--traffic-rate-divisor", type=int,
+                        default=DEFAULT_TRAFFIC_RATE_DIVISOR,
+                        help="Refresh pedestrians/traffic_lights every Nth tick instead of "
+                             "every tick (default 1 = every tick, unchanged behavior). "
+                             "Vehicles always refresh every tick regardless.")
     args = parser.parse_args()
 
     state = ServerState(silence_timeout=args.silence_timeout)
@@ -1033,7 +1074,8 @@ def main():
     carla_conn.connect()
 
     threads = [
-        TickLoopThread(carla_conn, state, args.tick_rate),
+        TickLoopThread(carla_conn, state, args.tick_rate,
+                       traffic_rate_divisor=args.traffic_rate_divisor),
         BroadcastThread(state),
     ]
     for t in threads:

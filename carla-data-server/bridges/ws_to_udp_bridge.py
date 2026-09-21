@@ -32,11 +32,19 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import socket
+import sys
 import time
 
 import websockets
 import websockets.exceptions
+
+# Allow importing the shared wire-protocol registry from the sibling client/
+# directory (this bridge stays raw-websockets - see module docstring - but
+# still shares message-type constants and helpers to avoid protocol drift).
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "client"))
+import wire  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,7 +82,9 @@ class WStoUDPBridge:
             })
         return {
             "vehicles": vehicles,
-            "timestamp": state.get("wall_time", time.time()),
+            "timestamp": state.get("wall_time", time.time()),  # kept for compat; wall-clock only
+            "tick": state.get("tick"),                          # monotonic ordering key
+            "sim_time": state.get("timestamp"),                 # use this for interpolation
         }
 
     def send_udp(self, payload):
@@ -98,20 +108,14 @@ class WStoUDPBridge:
                     log.info("Connected to data server as %s", client_id)
 
                     # Subscribe to vehicles
-                    await ws.send(json.dumps({
-                        "type": "subscribe",
-                        "payload": {"topics": ["vehicles"]}
-                    }))
+                    await ws.send(json.dumps(wire.make_subscribe(["vehicles"])))
 
                     # Keep-alive ping
                     async def keep_alive():
                         while True:
                             await asyncio.sleep(3)
                             try:
-                                await ws.send(json.dumps({
-                                    "type": "ping",
-                                    "payload": {}
-                                }))
+                                await ws.send(json.dumps(wire.make_ping(time.time())))
                             except Exception:
                                 return
 
@@ -119,12 +123,11 @@ class WStoUDPBridge:
 
                     try:
                         async for raw in ws:
-                            try:
-                                msg = json.loads(raw)
-                            except json.JSONDecodeError:
+                            msg = wire.parse_frame(raw)
+                            if msg is None or not wire.validate_message(msg):
                                 continue
 
-                            if msg.get("type") != "world_state":
+                            if msg.get("type") != wire.MSG_WORLD_STATE:
                                 continue
 
                             # Convert and send over UDP

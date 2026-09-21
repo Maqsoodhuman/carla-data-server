@@ -53,6 +53,8 @@ from typing import Callable, List, Optional
 import websockets
 import websockets.exceptions
 
+import wire
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
@@ -174,7 +176,7 @@ class CARLAClient:
     def send_ego_control(self, throttle: float = 0, steer: float = 0,
                          brake: float = 0, hand_brake: bool = False, reverse: bool = False):
         self._enqueue({
-            "type": "ego_control",
+            "type": wire.CMD_EGO_CONTROL,
             "payload": {
                 "throttle": throttle,
                 "steer": steer,
@@ -187,7 +189,7 @@ class CARLAClient:
     def send_spawn(self, blueprint_id: str, location: dict, rotation: dict,
                    autopilot: bool = False):
         self._enqueue({
-            "type": "spawn",
+            "type": wire.CMD_SPAWN,
             "payload": {
                 "blueprint_id": blueprint_id,
                 "transform": {"location": location, "rotation": rotation},
@@ -198,7 +200,7 @@ class CARLAClient:
     def send_spawn_at_index(self, blueprint_id: str, spawn_point_index: int,
                             autopilot: bool = False):
         self._enqueue({
-            "type": "spawn",
+            "type": wire.CMD_SPAWN,
             "payload": {
                 "blueprint_id": blueprint_id,
                 "spawn_point_index": spawn_point_index,
@@ -208,21 +210,18 @@ class CARLAClient:
 
     def send_list_spawn_points(self):
         self._enqueue({
-            "type": "list_spawn_points",
+            "type": wire.CMD_LIST_SPAWN_POINTS,
             "payload": {},
         })
 
     def send_destroy(self, actor_id: int):
         self._enqueue({
-            "type": "destroy",
+            "type": wire.CMD_DESTROY,
             "payload": {"actor_id": actor_id}
         })
 
     def send_ping(self):
-        self._enqueue({
-            "type": "ping",
-            "payload": {"client_ts": time.time()},
-        })
+        self._enqueue(wire.make_ping(time.time()))
 
     def disconnect(self):
         self._running = False
@@ -298,29 +297,28 @@ class CARLAClient:
 
     async def _handshake_and_receive(self, ws):
         async for raw in ws:
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
+            msg = wire.parse_frame(raw)
+            if msg is None:
                 log.warning("Received invalid JSON")
+                continue
+            if not wire.validate_message(msg):
+                log.warning("Received malformed message: %s", msg.get("type"))
                 continue
 
             msg_type = msg.get("type")
 
-            if msg_type == "welcome":
+            if msg_type == wire.MSG_WELCOME:
                 self.client_id = msg["client_id"]
                 self.on_connected(self.client_id)
-                await ws.send(json.dumps({
-                    "type": "subscribe",
-                    "payload": {"topics": self.subscriptions}
-                }))
+                await ws.send(json.dumps(wire.make_subscribe(self.subscriptions)))
 
-            elif msg_type == "world_state":
+            elif msg_type == wire.MSG_WORLD_STATE:
                 try:
                     self.on_world_state(msg)
                 except Exception:
                     log.exception("Error in on_world_state")
 
-            elif msg_type == "ack":
+            elif msg_type == wire.MSG_ACK:
                 # Special-case ping acks: parse and update RTT, do not propagate
                 # to on_ack so subclasses don't see ping noise.
                 if ack_is_ping(msg):
@@ -331,7 +329,7 @@ class CARLAClient:
                 except Exception:
                     log.exception("Error in on_ack")
 
-            elif msg_type == "client_left":
+            elif msg_type == wire.MSG_CLIENT_LEFT:
                 try:
                     self.on_peer_left(
                         msg.get("client_id", ""),
