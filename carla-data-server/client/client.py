@@ -224,7 +224,18 @@ class CARLAClient:
         self._enqueue(wire.make_ping(time.time()))
 
     def disconnect(self):
+        """Stop reconnecting AND close the live socket. Clearing _running only
+        stops the outer reconnect loop; without closing the socket the
+        receive/send/ping tasks for the current connection never finish, so
+        run() would hang instead of returning."""
         self._running = False
+        ws, loop = self._ws, self._loop
+        if ws is None or loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(ws.close(), loop)
+        except RuntimeError:
+            pass  # loop already closed - nothing left to tear down
 
     def _enqueue(self, msg: dict):
         if self._loop is None or self._send_queue is None:

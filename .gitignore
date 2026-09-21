@@ -8,6 +8,9 @@ dist/
 build/
 .pytest_cache/
 
+# Orchestration run state (coordinator runs, logs, data-server.log)
+.orchestration/
+
 # Virtual environments
 venv/
 venv-stub/
