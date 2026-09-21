@@ -33,7 +33,10 @@ class Coordinator:
         self._runs = {}      # run_id -> run dict
         self._order = []     # run_ids, oldest first
         self._workers = {}   # worker_id -> worker dict
+        self._messages = []  # agent-to-agent mailbox
+        self._message_seq = 0
         self._load()
+        self._load_messages()
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -254,6 +257,49 @@ class Coordinator:
                     self._persist(run)
                     return dict(entry)
             raise KeyError(action_id)
+
+    # ── agent mailbox ────────────────────────────────────────────────────────
+    # A durable, ordered channel so the agent on each machine can talk to the
+    # other directly instead of a human copying text between sessions. Kept
+    # separate from run evidence: messages outlive any single run.
+
+    def post_message(self, sender: str, to: str, text: str, kind: str = "note") -> dict:
+        with self._lock:
+            entry = {
+                "seq": self._message_seq + 1,
+                "at": P.now(),
+                "at_iso": P.iso(P.now()),
+                "from": sender,
+                "to": to,
+                "kind": kind,
+                "text": text,
+            }
+            self._message_seq += 1
+            self._messages.append(entry)
+            self._persist_messages()
+            return dict(entry)
+
+    def list_messages(self, since: int = 0, to: str = None, limit: int = 100) -> list:
+        with self._lock:
+            out = [m for m in self._messages if m["seq"] > since
+                   and (to is None or m["to"] in (to, "all"))]
+            return [dict(m) for m in out[-limit:]]
+
+    def _persist_messages(self):
+        path = os.path.join(self.state_dir, "messages.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"messages": self._messages}, f, indent=2)
+        os.replace(tmp, path)
+
+    def _load_messages(self):
+        path = os.path.join(self.state_dir, "messages.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self._messages = json.load(f).get("messages", [])
+        except (OSError, json.JSONDecodeError):
+            self._messages = []
+        self._message_seq = max((m.get("seq", 0) for m in self._messages), default=0)
 
     # ── workers ──────────────────────────────────────────────────────────────
 

@@ -19,6 +19,7 @@ import logging
 import os
 import signal
 import sys
+import time
 
 from . import protocol as P
 from . import scenarios as S
@@ -232,6 +233,40 @@ def cmd_rerun(args, cfg):
     return 0
 
 
+def cmd_mail(args, cfg):
+    """Agent-to-agent channel: the two machines' sessions talk through the
+    coordinator instead of a human copying text between them."""
+    api = _api(cfg)
+    if args.action == "send":
+        text = args.text
+        if args.file:
+            text = sys.stdin.read() if args.file == "-" else open(args.file).read()
+        if not text:
+            raise SystemExit("nothing to send: pass --text or --file")
+        entry = api.post_message(sender=args.sender, to=args.to, text=text, kind=args.kind)
+        _emit({"message": entry}, args.json,
+              f"sent #{entry['seq']} to {entry['to']} ({len(text)} chars)")
+        return 0
+
+    since = args.since
+    printed_any = False
+    while True:
+        messages = api.messages(since=since, to=args.to)
+        for m in messages:
+            since = max(since, m["seq"])
+            printed_any = True
+            if args.json:
+                print(json.dumps(m, indent=2))
+            else:
+                print(f"\n===== #{m['seq']} {m['at_iso']}  {m['from']} -> {m['to']}"
+                      f"  [{m['kind']}] =====\n{m['text']}")
+        if not args.watch:
+            if not printed_any and not args.json:
+                print(f"no messages for {args.to or 'anyone'} after #{args.since}")
+            return 0
+        time.sleep(args.interval)
+
+
 def cmd_doctor(args, cfg):
     report = run_doctor(cfg, args.role)
     _emit(report, args.json, format_doctor(report))
@@ -300,6 +335,20 @@ def build_parser():
     rerun = sub.add_parser("rerun", help="requeue the scenario from a previous run")
     rerun.add_argument("run_id")
     rerun.set_defaults(func=cmd_rerun)
+
+    mail = sub.add_parser("mail", help="agent-to-agent messages via the coordinator")
+    mail.add_argument("action", choices=["send", "read"])
+    mail.add_argument("--to", default=None,
+                      help="recipient: lab, client, or all (read: filter)")
+    mail.add_argument("--sender", default=os.environ.get("ORCH_AGENT", "agent"),
+                      help="who you are (env ORCH_AGENT)")
+    mail.add_argument("--text", help="message body")
+    mail.add_argument("--file", help="read body from a file, or - for stdin")
+    mail.add_argument("--kind", default="note")
+    mail.add_argument("--since", type=int, default=0, help="only messages after this seq")
+    mail.add_argument("--watch", action="store_true", help="keep polling for new messages")
+    mail.add_argument("--interval", type=float, default=5.0)
+    mail.set_defaults(func=cmd_mail)
 
     doctor = sub.add_parser("doctor", help="verify prerequisites and explain failures")
     doctor.add_argument("--role", choices=[P.ROLE_LAB, P.ROLE_CLIENT], default=P.ROLE_CLIENT)

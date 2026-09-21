@@ -160,6 +160,21 @@ def _make_handler(coordinator):
     def _workers(handler, match, query, body):
         return 200, {"workers": coordinator.list_workers()}
 
+    @route("POST", "/messages")
+    def _post_message(handler, match, query, body):
+        if not body.get("text"):
+            return 400, {"error": "text is required"}
+        entry = coordinator.post_message(
+            sender=body.get("from", "unknown"), to=body.get("to", "all"),
+            text=body["text"], kind=body.get("kind", "note"))
+        return 201, {"message": entry}
+
+    @route("GET", "/messages")
+    def _get_messages(handler, match, query, body):
+        since = int(query.get("since", ["0"])[0])
+        to = query.get("to", [None])[0]
+        return 200, {"messages": coordinator.list_messages(since=since, to=to)}
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "carla-orchestration/1"
@@ -335,3 +350,11 @@ class CoordinatorClient:
 
     def workers(self):
         return self._request("GET", "/workers")["workers"]
+
+    def post_message(self, sender, to, text, kind="note"):
+        return self._request("POST", "/messages", {
+            "from": sender, "to": to, "text": text, "kind": kind})["message"]
+
+    def messages(self, since=0, to=None):
+        query = f"?since={since}" + (f"&to={to}" if to else "")
+        return self._request("GET", f"/messages{query}")["messages"]
