@@ -51,9 +51,14 @@ def test_check_passes_without_carla_when_map_is_any(monkeypatch):
 
 
 def test_check_is_skipped_not_failed_when_map_cannot_be_read(monkeypatch):
-    # No CARLA PythonAPI here, so the map is unknowable - that must not be
-    # reported as a mismatch, and must not block.
+    # An unreadable map must not be reported as a mismatch, and must not block.
+    # Stub the read rather than relying on this machine having no CARLA: the
+    # lab machine DOES have one, and an ambient-dependent test fails there
+    # while passing here (exactly what happened - 87 passed, 1 failed).
     monkeypatch.setenv("CARLA_MAP", "UBAutonomousProvingGrounds")
+    monkeypatch.setattr("orchestration.doctor.loaded_carla_map",
+                        lambda host, port, timeout=10.0: (None, "carla PythonAPI "
+                                                                "not importable"))
     check = check_carla_map(Config.from_env())
     assert check["ok"] is False
     assert check["skipped"] is True
@@ -82,11 +87,15 @@ def test_correct_map_passes(monkeypatch):
 # ── blocking semantics ───────────────────────────────────────────────────────
 
 def test_skipped_checks_never_block(monkeypatch):
-    # On this machine there is no CARLA at all, so carla_map is skipped and
-    # the lab report must not be blocked by it.
+    # An unreadable map is reported but must not block. Stubbed so the result
+    # is the same on a machine with CARLA running and one without.
     monkeypatch.setenv("CARLA_MAP", "UBAutonomousProvingGrounds")
+    monkeypatch.setattr("orchestration.doctor.loaded_carla_map",
+                        lambda host, port, timeout=10.0: (None, "unreadable"))
     report = run_doctor(Config.from_env(), P.ROLE_LAB)
     assert "carla_map" not in report["blocking"]
+    carla_map = [c for c in report["checks"] if c["name"] == "carla_map"][0]
+    assert carla_map["skipped"] is True
 
 
 def test_wrong_map_does_block_the_lab(monkeypatch):
