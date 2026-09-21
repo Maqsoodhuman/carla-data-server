@@ -25,7 +25,10 @@ DEFAULTS = {
     # check (e.g. when deliberately testing Town10HD).
     "CARLA_MAP": "UBAutonomousProvingGrounds",
     "SHADOW_CARLA_HOST": "127.0.0.1",
-    "SHADOW_CARLA_PORT": 2001,
+    # NOT 2001: CARLA binds rpc_port, +1 and +2, so a second simulator must
+    # clear the primary's range (2000 -> 2000/2001/2002). Start it with
+    # -carla-rpc-port=2003.
+    "SHADOW_CARLA_PORT": 2003,
     "ORCH_TICK_RATE": 20.0,
     "ORCH_STATE_DIR": ".orchestration",
 }

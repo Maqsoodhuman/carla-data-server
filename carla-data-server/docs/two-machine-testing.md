@@ -144,6 +144,7 @@ other machine can diagnose without re-running anything.
 | `cannot reach coordinator at http://…` | Lab worker not running, wrong `LAB_HOST`/`COORDINATOR_PORT`, or the port is firewalled. Campus wifi silently drops inbound TCP to the lab PC — use Tailscale or the same LAN. `nc -zv <lab-host> 8770` to confirm. |
 | `connectivity` fails on `tcp_connect` | Same network issue, but for `DATA_SERVER_PORT`. |
 | Everything `SKIPPED` | Expected for `mirror` without the CARLA PythonAPI or a shadow simulator. |
+| `mirror` SKIPPED with "accepted TCP but is not a CARLA RPC endpoint" | `SHADOW_CARLA_PORT` points at the **primary** simulator's streaming port. CARLA binds `rpc_port`, `+1` and `+2`, so with CARLA on 2000 the ports 2001/2002 are already taken. Start the shadow with `-carla-rpc-port=2003` and set `SHADOW_CARLA_PORT=2003` (the default). |
 | Server runs in STUB mode | `carla` not importable — use `venv/`, not `venv-stub/`. `doctor --role lab` reports this. |
 | Runs end as `error` with `carla_map: loaded 'X', required 'Y'` | The simulator has the wrong map loaded. Load `CARLA_MAP` in CARLA, or set `CARLA_MAP=any` if you meant to use another map. |
 | `mirror` fails `shadow_map_matches` | The shadow CARLA is on a different map than the lab's — mirrored actors and traffic-light indexes would refer to different worlds. |
