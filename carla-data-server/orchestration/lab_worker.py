@@ -20,7 +20,7 @@ import time
 from . import REPO_ROOT
 from . import protocol as P
 from . import scenarios as S
-from .doctor import run_doctor
+from .doctor import check_carla_map, run_doctor
 
 log = logging.getLogger("orchestration.lab")
 
@@ -226,10 +226,16 @@ class LabWorker:
         return final
 
     def _prepare(self, scenario: str):
+        # A wrong map fails quietly rather than loudly (spawn indexes land
+        # elsewhere, mirrored traffic lights pair up against a different
+        # layout), so it gates the run instead of being discovered later.
+        map_check = check_carla_map(self.cfg)
+        if not map_check["ok"] and not map_check["skipped"]:
+            return False, f"carla_map: {map_check['detail']}"
         if self.manage_server:
             if not self.server.start():
                 return False, "data server is not running and could not be started"
-            return True, "data server up; lab prerequisites verified"
+            return True, f"data server up; {map_check['detail']}"
         ok = run_doctor(self.cfg, P.ROLE_LAB)
         blocking = [c for c in ok["checks"]
                     if not c["ok"] and c["name"] in ("data_server", "repo_layout")]

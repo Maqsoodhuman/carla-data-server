@@ -26,6 +26,7 @@ from client import CARLAClient
 
 from . import protocol as P
 from . import REPO_ROOT
+from .doctor import map_matches
 
 
 @dataclass
@@ -439,6 +440,17 @@ def scenario_mirror(ctx: ScenarioContext) -> Outcome:
     shadow.set_timeout(10.0)
     world = shadow.get_world()
     before = len(world.get_actors().filter("vehicle.*"))
+
+    # carla_mirror_client pairs traffic lights by index, so a shadow running a
+    # different map mirrors onto the wrong layout instead of failing outright.
+    shadow_map = world.get_map().name
+    metrics["shadow_map"] = shadow_map
+    metrics["required_map"] = cfg.carla_map
+    assertions.append(P.assertion(
+        "shadow_map_matches", map_matches(shadow_map, cfg.carla_map),
+        expected=cfg.carla_map, observed=shadow_map,
+        detail="both simulators must run the same map or mirrored actors and "
+               "traffic-light indexes refer to different worlds"))
 
     bridge = os.path.join(REPO_ROOT, "bridges", "carla_mirror_client.py")
     cmd = [sys.executable, bridge, "--server", cfg.data_server_url,

@@ -21,6 +21,9 @@ DEFAULTS = {
     "DATA_SERVER_BIND_HOST": "0.0.0.0",
     "CARLA_HOST": "127.0.0.1",
     "CARLA_PORT": 2000,
+    # The map every machine in a session must agree on. "any" disables the
+    # check (e.g. when deliberately testing Town10HD).
+    "CARLA_MAP": "UBAutonomousProvingGrounds",
     "SHADOW_CARLA_HOST": "127.0.0.1",
     "SHADOW_CARLA_PORT": 2001,
     "ORCH_TICK_RATE": 20.0,
@@ -61,6 +64,7 @@ class Config:
     data_server_bind_host: str
     carla_host: str
     carla_port: int
+    carla_map: str
     shadow_carla_host: str
     shadow_carla_port: int
     tick_rate: float
@@ -76,6 +80,7 @@ class Config:
             data_server_bind_host=_str("DATA_SERVER_BIND_HOST"),
             carla_host=_str("CARLA_HOST"),
             carla_port=_int("CARLA_PORT"),
+            carla_map=_str("CARLA_MAP"),
             shadow_carla_host=_str("SHADOW_CARLA_HOST"),
             shadow_carla_port=_int("SHADOW_CARLA_PORT"),
             tick_rate=_float("ORCH_TICK_RATE"),

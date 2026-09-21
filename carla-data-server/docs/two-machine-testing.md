@@ -55,9 +55,11 @@ recorded as a metric but never asserted on.
    export DATA_SERVER_PORT=8765      # data server binds 0.0.0.0:8765
    export CARLA_HOST=127.0.0.1
    export CARLA_PORT=2000
+   export CARLA_MAP=UBAutonomousProvingGrounds   # "any" disables the check
    export ORCH_TICK_RATE=20
    ```
-4. Start CARLA (headless is fine) on `CARLA_PORT`.
+4. Start CARLA (headless is fine) on `CARLA_PORT`, **with the map in
+   `CARLA_MAP` loaded** — see "Map verification" below.
 5. Run **one** command:
    ```
    cd carla-data-server/carla-data-server
@@ -85,6 +87,26 @@ The lab advertises a run; the client claims it, executes it, and submits a
 structured result with assertions, metrics, errors and artifacts; the lab
 attaches its server log and advances to the next scenario. Default policy is
 fail-fast (`--on-failure stop`); `--on-failure continue` runs the whole suite.
+
+## Map verification
+
+Every machine in a session must run the same CARLA map (`CARLA_MAP`, default
+`UBAutonomousProvingGrounds`). A wrong map does **not** fail loudly on its
+own — spawn indexes point at different physical locations, and
+`carla_mirror_client.py` pairs traffic lights *by index*, so a mismatched
+shadow mirrors onto a different layout while appearing to work. So it is
+checked explicitly:
+
+- `doctor --role lab` reports the loaded map versus the required one.
+- The lab worker re-checks before advertising each run, and refuses to reach
+  `lab_ready` on a mismatch (the run ends as `error` naming both maps).
+- The `mirror` scenario asserts the shadow simulator's map matches too.
+
+Comparison ignores CARLA's path prefix and case, so
+`/Game/Carla/Maps/UBAutonomousProvingGrounds` matches
+`UBAutonomousProvingGrounds`. When the map cannot be read at all (no CARLA
+PythonAPI), the check is reported as **SKIP**, never as a pass or a failure.
+Set `CARLA_MAP=any` to deliberately test another map (e.g. Town10HD).
 
 ## Inspecting
 
@@ -123,6 +145,8 @@ other machine can diagnose without re-running anything.
 | `connectivity` fails on `tcp_connect` | Same network issue, but for `DATA_SERVER_PORT`. |
 | Everything `SKIPPED` | Expected for `mirror` without the CARLA PythonAPI or a shadow simulator. |
 | Server runs in STUB mode | `carla` not importable — use `venv/`, not `venv-stub/`. `doctor --role lab` reports this. |
+| Runs end as `error` with `carla_map: loaded 'X', required 'Y'` | The simulator has the wrong map loaded. Load `CARLA_MAP` in CARLA, or set `CARLA_MAP=any` if you meant to use another map. |
+| `mirror` fails `shadow_map_matches` | The shadow CARLA is on a different map than the lab's — mirrored actors and traffic-light indexes would refer to different worlds. |
 | `websockets_legacy_api` FAIL | `server.py` uses the legacy asyncio API removed in websockets 14+. `pip install 'websockets<14'`. |
 | Run stuck, then `error` with `kind: timeout` | The coordinator swept it past its deadline; check the other machine's worker is alive via `status`. |
 

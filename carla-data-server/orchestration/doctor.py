@@ -14,8 +14,25 @@ from . import REPO_ROOT
 from . import protocol as P
 
 
-def _check(name, ok, detail, fix=""):
-    return {"name": name, "ok": bool(ok), "detail": detail, "fix": fix}
+def _check(name, ok, detail, fix="", skipped=False):
+    """A skipped check is one that could not be evaluated (rather than one
+    that failed); it is reported but never blocks."""
+    return {"name": name, "ok": bool(ok), "detail": detail, "fix": fix,
+            "skipped": bool(skipped)}
+
+
+def map_basename(name: str) -> str:
+    """CARLA reports maps as e.g. '/Game/Carla/Maps/UBAutonomousProvingGrounds';
+    compare only the final segment, case-insensitively."""
+    return str(name).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].strip().lower()
+
+
+def map_matches(loaded: str, expected: str) -> bool:
+    """True when the loaded map is the one this session requires. An expected
+    value of 'any' (or empty) disables the comparison."""
+    if not expected or expected.strip().lower() == "any":
+        return True
+    return map_basename(loaded) == map_basename(expected)
 
 
 def _tcp(host, port, timeout=5.0):
@@ -77,6 +94,44 @@ def check_carla_server(cfg):
                   "" if ok else f"start CARLA listening on {cfg.carla_host}:{cfg.carla_port}")
 
 
+def loaded_carla_map(host: str, port: int, timeout: float = 10.0):
+    """(map_name, error). Needs the CARLA PythonAPI; returns (None, reason)
+    when it cannot be read."""
+    try:
+        import carla
+    except ImportError:
+        return None, "carla PythonAPI not importable"
+    try:
+        client = carla.Client(host, port)
+        client.set_timeout(timeout)
+        return client.get_world().get_map().name, ""
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def check_carla_map(cfg, host=None, port=None, label="carla_map"):
+    """Verify the simulator has the map this session requires loaded.
+
+    A wrong map does not fail loudly on its own - spawn indexes point
+    somewhere else and mirrored traffic lights pair up by index against a
+    different layout - so it is checked explicitly.
+    """
+    host = host or cfg.carla_host
+    port = port or cfg.carla_port
+    expected = cfg.carla_map
+    if not expected or expected.strip().lower() == "any":
+        return _check(label, True, f"any map accepted (CARLA_MAP={expected!r})")
+    loaded, error = loaded_carla_map(host, port)
+    if loaded is None:
+        return _check(label, False, f"cannot verify map on {host}:{port} ({error})",
+                      "start CARLA and use a venv with the CARLA PythonAPI; "
+                      "set CARLA_MAP=any to skip this check", skipped=True)
+    ok = map_matches(loaded, expected)
+    return _check(label, ok, f"loaded {loaded!r}, required {expected!r}",
+                  "" if ok else f"load {expected} in CARLA on {host}:{port} "
+                                f"(or set CARLA_MAP to the map you actually want)")
+
+
 def check_data_server(cfg, host=None):
     host = host or cfg.lab_host
     ok, detail = _tcp(host, cfg.data_server_port)
@@ -103,13 +158,14 @@ def check_shadow_carla(cfg):
 def run_doctor(cfg, role: str) -> dict:
     checks = [check_python(), check_repo_layout(), check_websockets()]
     if role == P.ROLE_LAB:
-        checks += [check_carla_module(), check_carla_server(cfg),
+        checks += [check_carla_module(), check_carla_server(cfg), check_carla_map(cfg),
                    check_data_server(cfg, host="127.0.0.1")]
     else:
         checks += [check_coordinator(cfg), check_data_server(cfg), check_shadow_carla(cfg)]
 
     required = {c["name"] for c in checks} - {"shadow_carla", "carla_python_api"}
-    blocking = [c for c in checks if not c["ok"] and c["name"] in required]
+    blocking = [c for c in checks
+                if not c["ok"] and not c.get("skipped") and c["name"] in required]
     return {
         "role": role,
         "config": cfg.as_dict(),
@@ -123,12 +179,13 @@ def format_doctor(report: dict) -> str:
     lines = [f"doctor: role={report['role']}  ->  "
              f"{'OK' if report['ok'] else 'BLOCKED: ' + ', '.join(report['blocking'])}", ""]
     for check in report["checks"]:
-        mark = "PASS" if check["ok"] else "FAIL"
+        mark = "PASS" if check["ok"] else ("SKIP" if check.get("skipped") else "FAIL")
         lines.append(f"  [{mark}] {check['name']}: {check['detail']}")
         if not check["ok"] and check["fix"]:
             lines.append(f"         fix: {check['fix']}")
     cfg = report["config"]
     lines += ["", "  coordinator (client connects to): " + cfg["coordinator_url"],
               "  data server (client connects to): " + cfg["data_server_url"],
-              "  carla: %s:%s" % (cfg["carla_host"], cfg["carla_port"])]
+              "  carla: %s:%s  map: %s" % (cfg["carla_host"], cfg["carla_port"],
+                                           cfg["carla_map"])]
     return "\n".join(lines)
