@@ -246,12 +246,23 @@ class LabWorker:
     def _requeue_failures(self, report: dict):
         """Retry scenarios that failed before this sync, newest result per
         scenario, honouring the retry budget."""
-        latest = {}
+        latest, in_flight = {}, set()
         for run in self.api.list_runs(limit=50):
-            if run["state"] in (P.FAIL, P.ERROR):
+            if not P.is_terminal(run["state"]):
+                # A retry already queued for this scenario; queueing another
+                # would burn a second retry slot on the same failure.
+                in_flight.add(run["scenario"])
+            elif run["state"] in (P.FAIL, P.ERROR):
                 latest[run["scenario"]] = run
-            elif run["state"] == P.PASS:
-                latest.pop(run["scenario"], None)  # already fixed
+            else:
+                # PASS or SKIPPED: a skipped scenario is a missing precondition
+                # (no shadow sim, STUB mode) that a code push will not fix, so
+                # retrying it just exhausts the budget.
+                latest.pop(run["scenario"], None)
+        for scenario in list(latest):
+            if scenario in in_flight:
+                log.debug("%s already has a run in flight; not requeuing", scenario)
+                latest.pop(scenario)
         for scenario, run in latest.items():
             used = self._retries.get(scenario, 0)
             if used >= self.max_retries:

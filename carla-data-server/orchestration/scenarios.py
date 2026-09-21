@@ -115,17 +115,24 @@ class _Collector(CARLAClient):
         with self.lock:
             return dict(self.states[-1][1]) if self.states else {}
 
-    def vehicle_by_id(self, actor_id):
-        """Most recent view this participant has of one vehicle."""
+    def vehicle_by_id(self, actor_id, lookback: int = 1):
+        """This participant's CURRENT view of one vehicle.
+
+        Only the most recent `lookback` frames are searched, deliberately:
+        scanning all retained history would make this "has ever seen", so a
+        car that left the world would still be found forever and a departure
+        could never be observed.
+        """
         with self.lock:
-            for _, state in reversed(self.states):
+            recent = self.states[-lookback:] if lookback else self.states
+            for _, state in reversed(recent):
                 for v in state.get("vehicles", []):
                     if v.get("id") == actor_id:
                         return dict(v)
         return None
 
-    def sees_vehicle(self, actor_id) -> bool:
-        return self.vehicle_by_id(actor_id) is not None
+    def sees_vehicle(self, actor_id, lookback: int = 1) -> bool:
+        return self.vehicle_by_id(actor_id, lookback=lookback) is not None
 
 
 def _spawn_ego(collector, spawn_index, blueprint="vehicle.tesla.model3", timeout=15.0):
@@ -166,6 +173,11 @@ def _tick_stats(states):
 
 
 def _monotonic_ticks(ticks) -> bool:
+    """Strictly increasing AND actually checked: fewer than two samples is
+    vacuously 'ordered', which would let an assertion pass having verified
+    nothing."""
+    if len(ticks) < 2:
+        return False
     return all(b > a for a, b in zip(ticks, ticks[1:]))
 
 
@@ -276,7 +288,9 @@ def scenario_world_state(ctx: ScenarioContext) -> Outcome:
         observed=f"{ticks[:5]}...{ticks[-3:]}"))
 
     sim_times = [msg.get("timestamp") for msg in messages]
-    sim_ok = all(isinstance(t, (int, float)) for t in sim_times) and sim_times[-1] > sim_times[0]
+    sim_ok = (len(sim_times) >= 2
+              and all(isinstance(t, (int, float)) for t in sim_times)
+              and sim_times[-1] > sim_times[0])
     assertions.append(P.assertion(
         "sim_time_advances", sim_ok,
         expected="world_state.timestamp (sim seconds) increases over the run",
@@ -326,8 +340,7 @@ def scenario_sustained_stream(ctx: ScenarioContext) -> Outcome:
     thread = collector.run_in_thread()
     try:
         if not _wait_for(lambda: bool(collector.states), 15.0):
-            collector.disconnect()
-            thread.join(timeout=5)
+            # teardown happens in the finally block below
             return Outcome(P.FAIL, metrics, [P.assertion(
                 "stream_started", False, expected="world_state within 15s",
                 observed="nothing received")])
@@ -426,10 +439,25 @@ def scenario_reconnect(ctx: ScenarioContext) -> Outcome:
                 ctx.run["run_id"], "restart_data_server",
                 {"reason": "reconnect scenario"}, actor=ctx.worker_id)
             ctx.log(f"requested lab action {action['action_id']}: restart_data_server")
+
+            def _action_state():
+                """Poll our own action by id. A transient coordinator error
+                must not abort the scenario, and indexing [-1] would read
+                somebody else's action if another were queued."""
+                try:
+                    run = ctx.coordinator.get_run(ctx.run["run_id"])
+                except Exception as exc:  # transient HTTP/coordinator hiccup
+                    ctx.log(f"action poll failed (retrying): {exc}")
+                    return None
+                for entry in run.get("actions", []):
+                    if entry["action_id"] == action["action_id"]:
+                        return entry
+                return None
+
             done = _wait_for(
-                lambda: (ctx.coordinator.get_run(ctx.run["run_id"])["actions"][-1]["state"]
-                         in ("done", "failed")), 60.0, interval=0.5)
-            final = ctx.coordinator.get_run(ctx.run["run_id"])["actions"][-1]
+                lambda: (_action_state() or {}).get("state") in ("done", "failed"),
+                60.0, interval=0.5)
+            final = _action_state() or {"detail": "action never reported back"}
             if done and final.get("ok"):
                 mode = "server_restart"
             else:
@@ -535,8 +563,13 @@ def scenario_multi_client(ctx: ScenarioContext) -> Outcome:
             lambda: a.sees_vehicle(ego_a) and a.sees_vehicle(ego_b)
             and b.sees_vehicle(ego_a) and b.sees_vehicle(ego_b), 20.0)
         if not appeared:
-            return _stub_mode_skip(
+            skip = _stub_mode_skip(
                 f"spawned egos {ego_a}/{ego_b} never appeared in world_state")
+            # Keep what we did establish (distinct ids, spawns acked) instead
+            # of throwing it away with the skip.
+            skip.assertions.extend(assertions)
+            skip.metrics.update(metrics)
+            return skip
 
         va_own, va_peer = a.vehicle_by_id(ego_a), a.vehicle_by_id(ego_b)
         vb_own, vb_peer = b.vehicle_by_id(ego_b), b.vehicle_by_id(ego_a)
@@ -565,13 +598,16 @@ def scenario_multi_client(ctx: ScenarioContext) -> Outcome:
             loc = (v or {}).get("transform", {}).get("location", {})
             return (loc.get("x"), loc.get("y"))
 
-        drift = max(abs((_loc(va_peer)[i] or 0) - (_loc(vb_own)[i] or 0)) for i in (0, 1))
-        metrics["peer_position_drift_m"] = round(drift, 3)
+        pa, pb = _loc(va_peer), _loc(vb_own)
+        have_coords = all(isinstance(c, (int, float)) for c in (*pa, *pb))
+        drift = (max(abs(pa[i] - pb[i]) for i in (0, 1)) if have_coords else float("inf"))
+        metrics["peer_position_drift_m"] = None if not have_coords else round(drift, 3)
         assertions.append(P.assertion(
-            "participants_agree_on_peer_position", drift < 5.0,
+            "participants_agree_on_peer_position", have_coords and drift < 5.0,
             expected="<5 m between the two views of the same car "
                      "(samples are from slightly different ticks)",
-            observed=f"{drift:.2f} m"))
+            observed=(f"{drift:.2f} m" if have_coords
+                      else f"missing location fields: {pa} vs {pb}")))
 
         ids_a = {v["id"] for v in a.latest_vehicles().get("vehicles", [])}
         ids_b = {v["id"] for v in b.latest_vehicles().get("vehicles", [])}

@@ -8,6 +8,7 @@ Every mutation is serialized under one lock and persisted to
 coordinator restart and either machine's agent can read the same evidence.
 """
 
+import copy
 import json
 import os
 import threading
@@ -102,12 +103,14 @@ class Coordinator:
             self._runs[run_id] = run
             self._order.append(run_id)
             self._persist(run)
-            return dict(run)
+            return copy.deepcopy(run)
 
     def get_run(self, run_id: str):
+        # Deep copy: a shallow dict() would hand out the live history/actions/
+        # evidence/config lists, letting any caller mutate coordinator state.
         with self._lock:
             run = self._runs.get(run_id)
-            return dict(run) if run else None
+            return copy.deepcopy(run) if run else None
 
     def list_runs(self, limit: int = 50, status: str = None, suite_id: str = None) -> list:
         with self._lock:
@@ -116,7 +119,9 @@ class Coordinator:
             runs = [r for r in runs if r["state"] == status]
         if suite_id:
             runs = [r for r in runs if r.get("suite_id") == suite_id]
-        return [dict(r) for r in runs[-limit:]]
+        # limit=0 must mean "none", not "everything" (runs[-0:] is the whole list).
+        runs = runs[-limit:] if limit > 0 else []
+        return [copy.deepcopy(r) for r in runs]
 
     def _record(self, run: dict, state: str, actor: str, detail: str):
         ts = P.now()
@@ -140,13 +145,18 @@ class Coordinator:
                     f"run {run_id} is in {current!r}, expected {expected_from!r}")
             P.check_transition(current, to_state)
             self._record(run, to_state, actor, detail)
+            if to_state == P.CLIENT_READY:
+                # The deadline must cover execution, not the wait for a client:
+                # otherwise a client that starts minutes after the lab finds the
+                # run already swept, which breaks "start order does not matter".
+                run["deadline"] = P.now() + run["timeout_seconds"]
             # LAB_READY means the lab is done preparing; the coordinator
             # immediately advertises the run so a client can pick it up.
             if to_state == P.LAB_READY:
                 P.check_transition(P.LAB_READY, P.WAITING_FOR_CLIENT)
                 self._record(run, P.WAITING_FOR_CLIENT, "coordinator",
                              "advertised for client workers")
-            return dict(run)
+            return copy.deepcopy(run)
 
     def claim_next(self, role: str, worker_id: str) -> dict:
         """Atomically hand the oldest waiting run to one client worker."""
@@ -158,8 +168,9 @@ class Coordinator:
                 if run["state"] != P.WAITING_FOR_CLIENT:
                     continue
                 run["claimed_by"] = worker_id
+                run["deadline"] = P.now() + run["timeout_seconds"]
                 self._record(run, P.CLIENT_READY, worker_id, "claimed by client worker")
-                return dict(run)
+                return copy.deepcopy(run)
             return None
 
     def submit_result(self, run_id: str, result: dict, actor: str = "") -> dict:
@@ -178,9 +189,9 @@ class Coordinator:
             if run["state"] != P.COLLECTING:
                 P.check_transition(run["state"], P.COLLECTING)
                 self._record(run, P.COLLECTING, actor, "result submitted")
-            run["result"] = result
+            run["result"] = copy.deepcopy(result)
             self._record(run, status, actor, f"finalized as {status}")
-            return dict(run)
+            return copy.deepcopy(run)
 
     def attach_evidence(self, run_id: str, name: str, content: str,
                         kind: str = "log", actor: str = "") -> dict:

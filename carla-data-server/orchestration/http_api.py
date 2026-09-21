@@ -10,6 +10,7 @@ import logging
 import re
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit, parse_qs
@@ -49,7 +50,10 @@ def _make_handler(coordinator):
 
     @route("GET", "/runs")
     def _list_runs(handler, match, query, body):
-        limit = int(query.get("limit", ["50"])[0])
+        try:
+            limit = int(query.get("limit", ["50"])[0])
+        except ValueError:
+            return 400, {"error": "limit must be an integer"}
         status = query.get("status", [None])[0]
         suite = query.get("suite_id", [None])[0]
         return 200, {"runs": coordinator.list_runs(limit=limit, status=status,
@@ -171,7 +175,10 @@ def _make_handler(coordinator):
 
     @route("GET", "/messages")
     def _get_messages(handler, match, query, body):
-        since = int(query.get("since", ["0"])[0])
+        try:
+            since = int(query.get("since", ["0"])[0])
+        except ValueError:
+            return 400, {"error": "since must be an integer"}
         to = query.get("to", [None])[0]
         return 200, {"messages": coordinator.list_messages(since=since, to=to)}
 
@@ -338,7 +345,8 @@ class CoordinatorClient:
             "action": action, "params": params or {}, "actor": actor})["action"]
 
     def next_action(self, run_id, actor=""):
-        return self._request("GET", f"/runs/{run_id}/actions/next?actor={actor}")["action"]
+        actor_q = urllib.parse.quote(str(actor), safe="")
+        return self._request("GET", f"/runs/{run_id}/actions/next?actor={actor_q}")["action"]
 
     def complete_action(self, run_id, action_id, ok, detail=""):
         return self._request("POST", f"/runs/{run_id}/actions/{action_id}/complete",

@@ -64,6 +64,79 @@ unit-covered but mostly unexercised — that is the honest gap.
   `rpc_port`, `+1` and `+2`, so with the primary on 2000 use
   `-carla-rpc-port=2003`. A bare TCP probe of 2001 misleadingly succeeds.
 
+## Decision waiting for you: the subscribe handshake window
+
+The lab's first cross-machine run failed `world_state` on
+`unsubscribed_topics_absent`. Diagnosed and **confirmed by reproduction**
+(the lab's guess that it was the broadcast cache was wrong):
+
+`server/server.py:100` gives every new `ClientSession` **all** topics:
+
+```python
+subscriptions: Set[str] = field(default_factory=lambda: set(wire.VALID_TOPICS))
+```
+
+Between connect and the tick loop applying the client's `subscribe`, the
+client receives every topic — including base64 sensor frames it never asked
+for. On loopback that window closes within one tick, which is why it never
+showed up locally; at 34 ms RTT it was several messages. Reproduced on demand
+by delaying the subscribe by 150 ms:
+
+```
+topic sets seen: [all four], [all four], [all four], ['vehicles'], ['vehicles']
+```
+
+The scenario now judges filtering on steady state and reports the window as a
+metric, so the suite is correct either way. **The server behaviour is
+unchanged and is your call**, because it is wire-visible:
+
+- **Leave it.** Simple; a client that never subscribes still gets everything.
+  Cost: every connect and every reconnect ships unwanted topics briefly, and
+  over a WAN that can include large sensor payloads.
+- **Default to no topics.** Strictly correct — nothing is sent until asked
+  for. Every in-repo client subscribes immediately, so nothing here breaks,
+  but it is a protocol-visible change for any external consumer.
+- **Default to everything except `sensors`** (my suggestion). Keeps the
+  convenience, removes the only genuinely expensive payload, and sensors are
+  opt-in by nature since you must spawn one first.
+
+## Review pass (end of session)
+
+A review agent audited `orchestration/` after the suite was already green and
+found bugs the 127 tests did not. Fixed, each with a regression test in
+`tests/test_orch_bugfixes.py`:
+
+1. **`peer_departure` could never pass on real CARLA.** `vehicle_by_id`
+   scanned the whole retained history, so "has this car gone?" was always
+   answered "no, I saw it earlier". It now reads the current frame. This
+   would have failed on the Lab PC tomorrow for a reason unrelated to the
+   server.
+2. **A run's deadline started when it was created, not when it was claimed.**
+   The lab creates a run and then waits for a client with the clock already
+   running, so a client starting >90 s later found everything swept to ERROR
+   — directly contradicting "start order does not matter". Claiming now
+   restarts the clock.
+3. **The coordinator handed out its live internal objects.** `dict(run)` is
+   shallow, so callers could mutate `history`, `actions`, `config` and stored
+   results in place. Now deep-copied on the way out and on submit.
+4. **Four assertions could pass vacuously.** `_monotonic_ticks` returned True
+   for 0 or 1 samples, so "ticks are ordered" passed having checked nothing.
+   Fewer than two samples is now a failure.
+5. Smaller: `list_runs(limit=0)` returned everything; bad query params gave
+   HTTP 500 instead of 400; `_requeue_failures` could double-queue a scenario
+   and retried SKIPs forever; `reconnect` read `actions[-1]` (wrong action if
+   another were queued, and a transient error aborted the scenario);
+   `multi_client` discarded assertions when skipping and could compute a
+   vacuous 0 m position drift; `world_state` could claim sim-time advanced
+   from a single message; `sustained_stream` tore down twice.
+
+Still open from that review, not fixed (lower severity, noted for later):
+scenario threads can outlive `join(timeout=5)` when the server is unreachable
+(`CARLAClient.disconnect` early-returns if `_ws is None` while the reconnect
+loop is parked in backoff); `camera_follow` with `duration=0` never exits and
+`follower_exited_cleanly` can pass even if the follower never reached the
+server; `attach_evidence` holds the global lock during file I/O.
+
 ## Open issues
 
 - **Coordinator has no authentication.** Known, documented, and the reason
