@@ -54,6 +54,12 @@ python bridges/ws_to_udp_bridge.py --server ws://<host>:8765 \
                                    --udp-host localhost --udp-port 12345
 ```
 
+Republish onto UB-DigitalTwin's Redis channel so their existing clients work
+unmodified against this server (needs `pip install redis`):
+```
+python bridges/ws_to_redis_bridge.py --server ws://localhost:8765 --publish-hz 20
+```
+
 Follow an actor with a local CARLA's spectator camera (often a shadow sim):
 ```
 python scripts/camera_follow.py --server ws://localhost:8765 \

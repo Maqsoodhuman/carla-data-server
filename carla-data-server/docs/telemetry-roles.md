@@ -19,6 +19,32 @@ See `docs/wire-protocol.md` for the message contract these roles share.
 | `bridges/ws_to_udp_bridge.py` | raw `websockets` | `vehicles` | `subscribe`, `ping` only | tick-rate in, fire-and-forget UDP out | Reshapes `world_state` into Unity's `TrafficReceiver` UDP JSON format for the UB-MR app. Lossy by design — drops pedestrians/traffic_lights/sensors. |
 | `scripts/metrics_client.py` | raw `websockets` | `vehicles`, `pedestrians`, `traffic_lights`, `sensors` | `subscribe`, `ping` only | tick-rate | Read-only: measures latency, jitter, message size, bandwidth, actor counts. Reports once per second. |
 
+## Interop: running UB-DigitalTwin's Redis clients against this server
+
+`bridges/ws_to_redis_bridge.py` republishes `world_state` onto the Redis
+channel UB-DigitalTwin's clients already subscribe to, in the envelope from
+their `docs/telemetry-protocol.md`. That lets their roles
+(`multi_traffic_renderer`, `multi_agent_renderer`, and the rest) run
+**unmodified** with this server in place of their Redis hub, instead of
+forking each one onto `CARLAClient`.
+
+| | |
+| --- | --- |
+| Subscribes to | `vehicles` |
+| Publishes | type 2 `traffic` at a fixed `--publish-hz`; type 1 `destroy` on shutdown |
+| Does not publish | type 0 (`telemetry`) - this is a relay, not a participant, and every car is already in type 2; type 3 (`ego`) - `ws_to_udp_bridge.py` covers the Unity direction |
+| Needs | `pip install redis` (only this bridge does) |
+
+Translation gaps, because our wire protocol has no equivalent:
+
+- **`role_name` is always `""`.** Theirs uses it to skip `hero`/`external_ego`
+  — cars owned by other participants. Here the server is authoritative for
+  every actor including client egos, so there is nothing to exclude.
+- **`color` is not in `world_state`**, so one `--color` applies to all.
+
+`server_timestamp` carries our simulation clock, not wall clock, which is what
+their interpolator expects and what survives clock skew between machines.
+
 ## Why two of these are raw `websockets` instead of `CARLAClient`
 
 `ws_to_udp_bridge.py` and `metrics_client.py` only ever consume `world_state`
