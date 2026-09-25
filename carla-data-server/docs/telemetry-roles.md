@@ -38,7 +38,9 @@ forking each one onto `CARLAClient`.
 Translation gaps, because our wire protocol has no equivalent:
 
 - **`role_name` is passed through** from `world_state`, so their renderer's
-  `hero`/`external_ego` filtering works as designed.
+  `hero`/`external_ego` filtering sees whatever tag the spawning process set.
+  Cars spawned through *this* server's `spawn` command carry the blueprint
+  default, not `hero` — see "Vehicle identity" in `docs/wire-protocol.md`.
 - **`color` is not in `world_state`**, so one `--color` applies to all.
 
 `server_timestamp` carries our simulation clock, not wall clock, which is what

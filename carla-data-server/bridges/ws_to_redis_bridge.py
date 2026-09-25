@@ -28,10 +28,13 @@ It deliberately does NOT publish:
 
 Known translation gaps (our wire protocol carries no equivalent)
 ----------------------------------------------------------------
-  * `role_name` is emitted as "" for every vehicle. Their traffic renderer
-    uses it to skip `hero`/`external_ego` - cars belonging to other
-    participants. Here the server is authoritative for every actor including
-    client egos, so there is nothing to exclude; consumers see the whole world.
+  * `role_name` is emitted as "" for every vehicle, although `world_state`
+    does carry the real tag. Their traffic renderer uses it to skip
+    `hero`/`external_ego` - cars belonging to other participants, which those
+    participants publish themselves on type 0/3. This bridge publishes neither,
+    and the server is authoritative for every actor including client egos, so
+    there is nothing to exclude and nothing else to draw them: consumers see
+    the whole world.
   * `color` is not in `world_state`, so a single `--color` is applied to all.
 
 `server_timestamp` carries our simulation clock (`world_state.timestamp`),
@@ -138,9 +141,13 @@ def build_traffic_payload(state: dict, color: str = DEFAULT_COLOR) -> dict:
             continue  # unusable to their renderer; drop rather than half-send
         vehicles.append({
             "id": str(v.get("id")),
-            # Passed through from world_state. Their renderer uses this to skip
-            # cars owned by other participants (hero, external_ego).
-            "role_name": v.get("role_name", ""),
+            # Deliberately blank, even though world_state now carries the real
+            # role_name. Their renderer skips hero/external_ego because in
+            # their architecture those cars' owners announce them on type 0/3.
+            # This bridge publishes neither, so forwarding the tag would make
+            # every manually driven car silently vanish from their renderer
+            # with no other channel drawing it.
+            "role_name": "",
             "blueprint": blueprint,
             "color": color,
             "location": {"x": location.get("x"), "y": location.get("y"),

@@ -48,14 +48,22 @@ the wrong purpose has already caused a real bug (see below) — pick correctly:
   tick_interval`). This is the correct basis for time-based interpolation or
   extrapolation between snapshots, because it advances in lockstep with the
   simulation regardless of network jitter or when a message actually arrives.
+  Under `--observe` it is the simulator's own elapsed time, so it does not
+  start at zero and it can jump backwards if the clock owner reloads the
+  world — see "Clock ownership" below.
 ### Vehicle identity
 
-Each vehicle carries `role_name`, CARLA's own tag for who spawned it and why:
-`ego_vehicle` for a car driven by an external autonomy stack, `hero` for a
-manually driven one, empty for background traffic. Consumers that must
-distinguish another participant's car from ordinary traffic key on this rather
-than guessing from the blueprint. `is_ego` is a different thing: it is computed
-per viewing client and marks the car *that client* owns.
+Each vehicle carries `role_name`, CARLA's own tag for who spawned it and why —
+passed through untouched from the blueprint: `ego_vehicle` for a car driven by
+an external autonomy stack, `hero` for a manually driven one. Consumers that
+must distinguish another participant's car from ordinary traffic key on this
+rather than guessing from the blueprint.
+
+This server does **not** set `role_name` on the actors it spawns, so a vehicle
+spawned through `spawn` carries the blueprint default and is indistinguishable
+from background traffic. The field identifies cars spawned by *other*
+processes; use `is_ego`, which is computed per viewing client, for the car the
+receiving client itself owns.
 
 - **`wall_time`** — `time.time()` on the server host at the moment the
   snapshot was built. Use this **only** for network latency measurement
@@ -79,12 +87,35 @@ server does: it sets `synchronous_mode`, `fixed_delta_seconds`, and calls
 
 Start it with `--observe` when something else owns the clock — an Autoware
 bridge, or a dedicated time master. The server then leaves the world settings
-untouched, never ticks, and reads `tick` and `timestamp` from the simulator's
-own snapshot instead of counting its own cycles. Controls are still applied,
-because setting an actor's control does not advance the world.
+untouched and never ticks. Controls are still applied, because setting an
+actor's control does not advance the world.
 
 Two processes advancing one synchronous world double-step it, so the choice is
 not optional when sharing a simulator.
+
+Observing splits the two time fields, because only one of them can come from
+the simulator without breaking its contract:
+
+- **`tick`** stays a local counter, `+1` per published message, exactly as in
+  owner mode. It is the ordering and gap-detection field, so it has to
+  increment by one and never go backwards — and CARLA's frame number does
+  neither once another process is free to reload the world.
+- **`timestamp`** becomes the simulator's own `elapsed_seconds`. It is the
+  interpolation basis, so it has to track the world someone else is stepping;
+  accumulating `1/tick_rate` locally would drift from it whenever the clock
+  owner runs at a different rate. It therefore no longer starts at zero, and
+  it restarts if the owner reloads the world (logged when that happens).
+
+`spawn`, `destroy` and `spawn_sensor` still block until the *owner's* next
+tick, because that is how CARLA's synchronous mode works — so a stalled clock
+owner freezes those commands, and with them the tick loop, until the CARLA
+client timeout expires. The destroy path logs before it blocks.
+
+`--tick-rate` still caps the publish rate. A cycle that finds the world on the
+same frame as the last one **publishes nothing** — so an owner slower than
+`--tick-rate` downsamples to the owner's rate rather than emitting duplicate
+snapshots, and a clock owner that has died makes the stream go quiet instead of
+repeating one state forever. The server warns once per second while stalled.
 
 ## Publish-rate contract
 

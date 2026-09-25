@@ -168,6 +168,9 @@ class CarlaConnection:
     def connect(self):
         if not CARLA_AVAILABLE:
             log.info("STUB: pretending to connect to CARLA")
+            if self.observe_only:
+                log.warning("--observe has no effect in STUB mode: there is no "
+                            "simulator clock to follow, so the stub keeps its own")
             return
         self.client = carla.Client(self.host, self.port)
         self.client.set_timeout(10.0)
@@ -203,14 +206,15 @@ class CarlaConnection:
                     # the clock may have changed them since we connected.
                     # Pushing our stale snapshot back would disrupt it.
                     log.info("CARLA settings left untouched (observe-only)")
-                elif self._original_settings is not None:
-                    self.world.apply_settings(self._original_settings)
                 else:
-                    s = self.world.get_settings()
-                    s.synchronous_mode = False
-                    s.fixed_delta_seconds = None
-                    self.world.apply_settings(s)
-            log.info("CARLA settings restored")
+                    if self._original_settings is not None:
+                        self.world.apply_settings(self._original_settings)
+                    else:
+                        s = self.world.get_settings()
+                        s.synchronous_mode = False
+                        s.fixed_delta_seconds = None
+                        self.world.apply_settings(s)
+                    log.info("CARLA settings restored")
         except Exception as e:
             log.warning("CARLA cleanup error: %s", e)
 
@@ -276,6 +280,11 @@ class CarlaConnection:
             return _stub_world_state(tick, timestamp)
 
         with self._lock:
+            if self.observe_only:
+                # Stamp from inside this lock hold, not from the earlier
+                # world_clock() read: between the two, another thread may have
+                # blocked here long enough for the clock owner to advance.
+                timestamp = float(self.world.get_snapshot().timestamp.elapsed_seconds)
             actors = self.world.get_actors()
             vehicles, pedestrians, traffic_lights = [], [], []
 
@@ -291,9 +300,11 @@ class CarlaConnection:
                     vehicles.append({
                         "id": actor.id,
                         "type_id": actor.type_id,
-                        # Who spawned this vehicle and why: CARLA's own tag,
-                        # e.g. "ego_vehicle" for an Autoware-driven car or
-                        # "hero" for a manual one. Empty for background traffic.
+                        # Whatever tag the spawner gave this vehicle, passed
+                        # through untouched: "ego_vehicle" for an Autoware-driven
+                        # car, "hero" for a manually driven one. We do not set it
+                        # on the actors we spawn, so those carry the blueprint
+                        # default like any other traffic.
                         "role_name": actor.attributes.get("role_name", ""),
                         "transform": transform,
                         "velocity": {"x": v.x, "y": v.y, "z": v.z},
@@ -417,6 +428,9 @@ class CarlaConnection:
                     pass
                 self._sensors.pop(actor_id, None)
                 self.sensor_buffer.remove(actor_id)
+            if self.observe_only:
+                log.info("destroying actor %d; in observe-only this blocks "
+                         "until the clock owner ticks", actor_id)
             actor.destroy()
             return True
 
@@ -577,6 +591,8 @@ class TickLoopThread(threading.Thread):
         self.traffic_rate_divisor = max(1, traffic_rate_divisor)
         self._tick = 0
         self._sim_time = 0.0
+        self._observed_frame = None
+        self._stalled_cycles = 0
         self._cached_traffic = {"pedestrians": [], "traffic_lights": []}
 
     def run(self):
@@ -600,38 +616,29 @@ class TickLoopThread(threading.Thread):
                         if session.ego_actor_id and session.last_control
                     ]
                 self.carla.apply_and_tick(controls_to_apply)
-                if self.carla.observe_only:
-                    # Someone else advances the world, so take its clock rather
-                    # than counting our own cycles, which would drift from it.
-                    clock = self.carla.world_clock()
-                    if clock is not None:
-                        self._tick, self._sim_time = clock
-                    else:
-                        self._tick += 1
-                        self._sim_time += self.tick_interval
-                else:
+
+                sim_time = self._advance_clock()
+                if sim_time is not None:
                     self._tick += 1
-                    self._sim_time += self.tick_interval
+                    refresh_traffic = (self._tick % self.traffic_rate_divisor == 0)
+                    world_state = self.carla.snapshot(self._tick, sim_time, refresh_traffic)
+                    if refresh_traffic:
+                        self._cached_traffic = {
+                            "pedestrians": world_state["pedestrians"],
+                            "traffic_lights": world_state["traffic_lights"],
+                        }
+                    else:
+                        world_state["pedestrians"] = self._cached_traffic["pedestrians"]
+                        world_state["traffic_lights"] = self._cached_traffic["traffic_lights"]
 
-                refresh_traffic = (self._tick % self.traffic_rate_divisor == 0)
-                world_state = self.carla.snapshot(self._tick, self._sim_time, refresh_traffic)
-                if refresh_traffic:
-                    self._cached_traffic = {
-                        "pedestrians": world_state["pedestrians"],
-                        "traffic_lights": world_state["traffic_lights"],
-                    }
-                else:
-                    world_state["pedestrians"] = self._cached_traffic["pedestrians"]
-                    world_state["traffic_lights"] = self._cached_traffic["traffic_lights"]
-
-                try:
-                    self.state.broadcast_queue.put_nowait(world_state)
-                except queue.Full:
                     try:
-                        self.state.broadcast_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                    self.state.broadcast_queue.put_nowait(world_state)
+                        self.state.broadcast_queue.put_nowait(world_state)
+                    except queue.Full:
+                        try:
+                            self.state.broadcast_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                        self.state.broadcast_queue.put_nowait(world_state)
             except Exception as e:
                 log.exception("TickLoop iteration error: %s", e)
 
@@ -641,6 +648,51 @@ class TickLoopThread(threading.Thread):
                 time.sleep(sleep_time)
             elif elapsed > self.tick_interval * 1.5:
                 log.warning("TickLoop overrun: %.1f ms", elapsed * 1000)
+
+    def _advance_clock(self):
+        """Simulation time to stamp this cycle with, or None if there is
+        nothing new to publish.
+
+        When we own the clock, each cycle advances it by one tick interval.
+        When someone else owns it we must read the simulator instead - our
+        cycle count says nothing about how far the world actually moved. A
+        cycle that finds the world still on the last frame has nothing new to
+        say: publishing anyway would repeat a snapshot under a fresh tick, and
+        a clock owner that had died would look like a healthy stream of
+        identical states forever.
+
+        `tick` stays a local counter in both modes. It is the ordering and
+        gap-detection field, so it has to increment by one and never go
+        backwards; CARLA's frame number does neither once another process is
+        free to reload the world.
+        """
+        if not self.carla.observe_only:
+            self._sim_time += self.tick_interval
+            return self._sim_time
+
+        clock = self.carla.world_clock()
+        if clock is None:  # STUB mode: no simulator to read a clock from
+            self._sim_time += self.tick_interval
+            return self._sim_time
+
+        frame, elapsed = clock
+        if frame == self._observed_frame:
+            self._stalled_cycles += 1
+            if self._stalled_cycles % max(1, int(self.tick_rate)) == 0:
+                log.warning("observe-only: world still on frame %d after %d "
+                            "cycles - is the clock owner still running?",
+                            frame, self._stalled_cycles)
+            return None
+        if self._observed_frame is not None and frame < self._observed_frame:
+            log.warning("observe-only: simulator frame went backwards (%d -> %d); "
+                        "the clock owner has probably reloaded the world, so "
+                        "timestamp restarts with it", self._observed_frame, frame)
+        if self._stalled_cycles:
+            log.info("observe-only: world advancing again at frame %d", frame)
+            self._stalled_cycles = 0
+        self._observed_frame = frame
+        self._sim_time = elapsed
+        return self._sim_time
 
     def _drain_commands(self):
         # Collect all commands, but for ego_control, only keep the last per client
