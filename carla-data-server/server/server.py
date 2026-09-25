@@ -148,11 +148,16 @@ class SensorBuffer:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class CarlaConnection:
-    def __init__(self, host: str, port: int, tick_rate: float, sensor_buffer: SensorBuffer):
+    def __init__(self, host: str, port: int, tick_rate: float, sensor_buffer: SensorBuffer,
+                 observe_only: bool = False):
         self.host = host
         self.port = port
         self.tick_rate = tick_rate
         self.sensor_buffer = sensor_buffer
+        # Observe-only: another process owns the simulation clock (Autoware's
+        # bridge, a dedicated time master). We must not set synchronous mode
+        # and must never call world.tick(), or two clients advance one world.
+        self.observe_only = observe_only
         self.client = None
         self.world = None
         self._original_settings = None
@@ -168,6 +173,12 @@ class CarlaConnection:
         self.client.set_timeout(10.0)
         self.world = self.client.get_world()
         self._original_settings = self.world.get_settings()
+        if self.observe_only:
+            current = self.world.get_settings()
+            log.info("Connected to CARLA at %s:%d (observe-only; clock owned "
+                     "elsewhere, world is %s)", self.host, self.port,
+                     "synchronous" if current.synchronous_mode else "asynchronous")
+            return
         settings = self.world.get_settings()
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 1.0 / self.tick_rate
@@ -187,7 +198,12 @@ class CarlaConnection:
                     except Exception:
                         pass
                 self._sensors.clear()
-                if self._original_settings is not None:
+                if self.observe_only:
+                    # We never changed the settings, and the process that owns
+                    # the clock may have changed them since we connected.
+                    # Pushing our stale snapshot back would disrupt it.
+                    log.info("CARLA settings left untouched (observe-only)")
+                elif self._original_settings is not None:
                     self.world.apply_settings(self._original_settings)
                 else:
                     s = self.world.get_settings()
@@ -226,13 +242,29 @@ class CarlaConnection:
                     log.warning("apply_control failed for actor %d, evicting: %s",
                                 actor_id, e)
                     self._actor_cache.pop(actor_id, None)
-            self.world.tick()
+            # Controls are still applied when observing - setting an actor's
+            # control does not advance the world. Only the tick is withheld.
+            if not self.observe_only:
+                self.world.tick()
 
     def tick(self):
-        if not CARLA_AVAILABLE:
+        if not CARLA_AVAILABLE or self.observe_only:
             return
         with self._lock:
             self.world.tick()
+
+    def world_clock(self):
+        """The simulation's own frame and elapsed seconds.
+
+        When another process owns the clock our local cycle count says nothing
+        about how far the world has advanced, so the published tick and
+        timestamp must come from the simulator itself.
+        """
+        if not CARLA_AVAILABLE:
+            return None
+        with self._lock:
+            stamp = self.world.get_snapshot().timestamp
+        return int(stamp.frame), float(stamp.elapsed_seconds)
 
     def snapshot(self, tick: int, timestamp: float, refresh_traffic: bool = True) -> dict:
         """Build one world_state snapshot. When refresh_traffic is False,
@@ -259,6 +291,10 @@ class CarlaConnection:
                     vehicles.append({
                         "id": actor.id,
                         "type_id": actor.type_id,
+                        # Who spawned this vehicle and why: CARLA's own tag,
+                        # e.g. "ego_vehicle" for an Autoware-driven car or
+                        # "hero" for a manual one. Empty for background traffic.
+                        "role_name": actor.attributes.get("role_name", ""),
                         "transform": transform,
                         "velocity": {"x": v.x, "y": v.y, "z": v.z},
                         "angular_vel": {"x": av.x, "y": av.y, "z": av.z},
@@ -472,6 +508,7 @@ def _stub_world_state(tick: int, timestamp: float) -> dict:
         "vehicles": [{
             "id": 1,
             "type_id": "vehicle.tesla.model3",
+            "role_name": "",
             "transform": {
                 "location": {"x": math.sin(t) * 20, "y": math.cos(t) * 20, "z": 0.5},
                 "rotation": {"pitch": 0, "yaw": math.degrees(t) % 360, "roll": 0},
@@ -563,8 +600,18 @@ class TickLoopThread(threading.Thread):
                         if session.ego_actor_id and session.last_control
                     ]
                 self.carla.apply_and_tick(controls_to_apply)
-                self._tick += 1
-                self._sim_time += self.tick_interval
+                if self.carla.observe_only:
+                    # Someone else advances the world, so take its clock rather
+                    # than counting our own cycles, which would drift from it.
+                    clock = self.carla.world_clock()
+                    if clock is not None:
+                        self._tick, self._sim_time = clock
+                    else:
+                        self._tick += 1
+                        self._sim_time += self.tick_interval
+                else:
+                    self._tick += 1
+                    self._sim_time += self.tick_interval
 
                 refresh_traffic = (self._tick % self.traffic_rate_divisor == 0)
                 world_state = self.carla.snapshot(self._tick, self._sim_time, refresh_traffic)
@@ -1061,6 +1108,12 @@ def main():
     parser.add_argument("--silence-timeout", type=float,
                         default=DEFAULT_SILENCE_TIMEOUT,
                         help="Seconds without inbound traffic before evicting a client")
+    parser.add_argument("--observe", action="store_true",
+                        help="do not own the simulation clock: skip synchronous-mode "
+                             "setup and never call world.tick(). Use when another "
+                             "process advances the world (an Autoware bridge, a "
+                             "dedicated time master). tick and timestamp are then "
+                             "read from the simulator instead of counted locally.")
     parser.add_argument("--traffic-rate-divisor", type=int,
                         default=DEFAULT_TRAFFIC_RATE_DIVISOR,
                         help="Refresh pedestrians/traffic_lights every Nth tick instead of "
@@ -1070,7 +1123,8 @@ def main():
 
     state = ServerState(silence_timeout=args.silence_timeout)
     sensor_buffer = SensorBuffer()
-    carla_conn = CarlaConnection(args.carla_host, args.carla_port, args.tick_rate, sensor_buffer)
+    carla_conn = CarlaConnection(args.carla_host, args.carla_port, args.tick_rate,
+                                 sensor_buffer, observe_only=args.observe)
     carla_conn.connect()
 
     threads = [

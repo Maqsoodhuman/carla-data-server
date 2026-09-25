@@ -48,6 +48,15 @@ the wrong purpose has already caused a real bug (see below) — pick correctly:
   tick_interval`). This is the correct basis for time-based interpolation or
   extrapolation between snapshots, because it advances in lockstep with the
   simulation regardless of network jitter or when a message actually arrives.
+### Vehicle identity
+
+Each vehicle carries `role_name`, CARLA's own tag for who spawned it and why:
+`ego_vehicle` for a car driven by an external autonomy stack, `hero` for a
+manually driven one, empty for background traffic. Consumers that must
+distinguish another participant's car from ordinary traffic key on this rather
+than guessing from the blueprint. `is_ego` is a different thing: it is computed
+per viewing client and marks the car *that client* owns.
+
 - **`wall_time`** — `time.time()` on the server host at the moment the
   snapshot was built. Use this **only** for network latency measurement
   (`local_now - wall_time`), as `scripts/metrics_client.py` and
@@ -61,6 +70,21 @@ interpolate/extrapolate between lossy, unordered UDP packets. That's wrong for
 exactly the reason above. The bridge now also sends `tick` and `sim_time`
 (`= world_state.timestamp`) alongside the original `timestamp` field (kept for
 compatibility) — downstream code should migrate to `sim_time`/`tick`.
+
+## Clock ownership
+
+In synchronous mode exactly one process may advance the world. By default this
+server does: it sets `synchronous_mode`, `fixed_delta_seconds`, and calls
+`world.tick()` once per cycle.
+
+Start it with `--observe` when something else owns the clock — an Autoware
+bridge, or a dedicated time master. The server then leaves the world settings
+untouched, never ticks, and reads `tick` and `timestamp` from the simulator's
+own snapshot instead of counting its own cycles. Controls are still applied,
+because setting an actor's control does not advance the world.
+
+Two processes advancing one synchronous world double-step it, so the choice is
+not optional when sharing a simulator.
 
 ## Publish-rate contract
 

@@ -31,6 +31,13 @@ python server/server.py --host 0.0.0.0 --port 8765 \
                        --tick-rate 20 --silence-timeout 5
 ```
 
+Share a simulator with something that already owns the clock (an Autoware
+bridge, a dedicated time master) — the server then never calls `world.tick()`
+and reads `tick`/`timestamp` from the simulator instead:
+```
+python server/server.py --observe --carla-host localhost --carla-port 2000
+```
+
 Base client (spectator / manual / mr_agent roles):
 ```
 python client/client.py --server ws://localhost:8765 --role spectator

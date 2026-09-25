@@ -37,9 +37,8 @@ forking each one onto `CARLAClient`.
 
 Translation gaps, because our wire protocol has no equivalent:
 
-- **`role_name` is always `""`.** Theirs uses it to skip `hero`/`external_ego`
-  — cars owned by other participants. Here the server is authoritative for
-  every actor including client egos, so there is nothing to exclude.
+- **`role_name` is passed through** from `world_state`, so their renderer's
+  `hero`/`external_ego` filtering works as designed.
 - **`color` is not in `world_state`**, so one `--color` applies to all.
 
 `server_timestamp` carries our simulation clock, not wall clock, which is what

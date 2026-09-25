@@ -138,7 +138,9 @@ def build_traffic_payload(state: dict, color: str = DEFAULT_COLOR) -> dict:
             continue  # unusable to their renderer; drop rather than half-send
         vehicles.append({
             "id": str(v.get("id")),
-            "role_name": "",
+            # Passed through from world_state. Their renderer uses this to skip
+            # cars owned by other participants (hero, external_ego).
+            "role_name": v.get("role_name", ""),
             "blueprint": blueprint,
             "color": color,
             "location": {"x": location.get("x"), "y": location.get("y"),
