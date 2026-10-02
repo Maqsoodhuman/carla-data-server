@@ -230,6 +230,11 @@ class InteractiveDriver(CARLAClient):
                          self._metrics_hz, self._metrics_lat_avg, self._metrics_jitter)
 
         for sensor in state.get("sensors", []):
+            # The server sends every camera to every client subscribed to
+            # sensors. Show only ours, or a second driver's camera replaces
+            # this window's view and our own car looks frozen.
+            if sensor.get("actor_id") != self._camera_id:
+                continue
             if sensor.get("encoding") == "jpeg" and sensor.get("data"):
                 try:
                     jpeg_bytes = base64.b64decode(sensor["data"])
