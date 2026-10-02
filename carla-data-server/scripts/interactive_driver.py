@@ -33,6 +33,14 @@ import time
 
 import pygame
 
+try:
+    from PIL import Image
+except ImportError:
+    # Camera frames arrive as JPEG and Pillow decodes them. Without it every
+    # frame fails to decode and the window sits on "Waiting for camera feed"
+    # with nothing to say why, so refuse to start instead.
+    sys.exit("interactive_driver needs Pillow to show the camera: pip install pillow")
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "client"))
 from client import CARLAClient
 import wire
@@ -238,7 +246,6 @@ class InteractiveDriver(CARLAClient):
             if sensor.get("encoding") == "jpeg" and sensor.get("data"):
                 try:
                     jpeg_bytes = base64.b64decode(sensor["data"])
-                    from PIL import Image
                     pil_img = Image.open(io.BytesIO(jpeg_bytes))
                     raw = pil_img.tobytes()
                     pg_surface = pygame.image.fromstring(raw, pil_img.size, pil_img.mode)
