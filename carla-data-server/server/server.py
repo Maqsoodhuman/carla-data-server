@@ -170,6 +170,9 @@ class CarlaConnection:
         self._lock = threading.Lock()
         self._sensors: Dict[int, "carla.Sensor"] = {}
         self._actor_cache: Dict[int, "carla.Actor"] = {}  # id -> direct reference
+        # Why the most recent spawn_actor returned None, for the ack. Only the
+        # tick thread spawns, so this needs no lock.
+        self.last_spawn_error = "spawn failed"
 
     def connect(self):
         if not CARLA_AVAILABLE:
@@ -390,13 +393,17 @@ class CarlaConnection:
             bp_lib = self.world.get_blueprint_library()
             bp = bp_lib.find(blueprint_id)
             if bp is None:
+                self.last_spawn_error = f"unknown blueprint {blueprint_id}"
                 return None
 
             if spawn_point_index is not None:
                 spawn_points = self.world.get_map().get_spawn_points()
                 if not spawn_points:
+                    self.last_spawn_error = "map has no spawn points"
                     return None
                 if spawn_point_index < 0 or spawn_point_index >= len(spawn_points):
+                    self.last_spawn_error = (f"spawn point {spawn_point_index} out of range "
+                                             f"(0..{len(spawn_points) - 1})")
                     return None
                 t = spawn_points[spawn_point_index]
             elif transform is not None:
@@ -407,6 +414,7 @@ class CarlaConnection:
                     carla.Rotation(pitch=rot["pitch"], yaw=rot["yaw"], roll=rot["roll"]),
                 )
             else:
+                self.last_spawn_error = "spawn needs a spawn_point_index or a transform"
                 return None
 
             # Only vehicles: a sensor placed high above the map on purpose is
@@ -417,10 +425,12 @@ class CarlaConnection:
                             "road network covers more area than its built geometry.",
                             blueprint_id, t.location.x, t.location.y, t.location.z,
                             GROUND_PROBE_DOWN)
+                self.last_spawn_error = "no ground at that spawn point (the car would fall)"
                 return None
 
             actor = self.world.try_spawn_actor(bp, t)
             if actor is None:
+                self.last_spawn_error = "spawn point is occupied by another actor"
                 return None
             self._actor_cache[actor.id] = actor  # cache direct reference
             if autopilot and actor.type_id.startswith("vehicle."):
@@ -805,7 +815,7 @@ class TickLoopThread(threading.Thread):
                     if session and session.ego_actor_id is None:
                         session.ego_actor_id = actor_id
             else:
-                ack.update({"status": "failed", "message": "spawn failed"})
+                ack.update({"status": "failed", "message": self.carla.last_spawn_error})
 
         elif cmd.type == "destroy":
             actor_id = cmd.payload.get("actor_id")

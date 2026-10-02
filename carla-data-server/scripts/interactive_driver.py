@@ -46,6 +46,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("driver")
 
+MAX_SPAWN_ATTEMPTS = 50
 WINDOW_W = 800
 WINDOW_H = 600
 
@@ -59,6 +60,8 @@ class InteractiveDriver(CARLAClient):
             role="interactive_driver",
         )
         self._spawn_index = spawn_index
+        self._num_spawn_points = 0
+        self._spawn_attempts = 0
         self._state = "INIT"
         self._ego_id = None
         self._camera_id = None
@@ -119,6 +122,8 @@ class InteractiveDriver(CARLAClient):
                 self.disconnect()
                 return
             log.info("Got %d spawn points, using index %d", len(points), self._spawn_index)
+            self._num_spawn_points = len(points)
+            self._spawn_index %= len(points)
             self._state = "SPAWNING"
             self.send_spawn_at_index(
                 blueprint_id="vehicle.tesla.model3",
@@ -146,8 +151,24 @@ class InteractiveDriver(CARLAClient):
                     },
                 )
             else:
-                log.error("Spawn failed: %s", ack.get("message"))
-                self.disconnect()
+                # A point can be occupied or over empty space; either way the
+                # next one usually works, so move on rather than sit in
+                # SPAWNING with no car.
+                self._spawn_attempts += 1
+                if self._spawn_attempts >= MAX_SPAWN_ATTEMPTS:
+                    log.error("Spawn failed at %d points in a row, giving up. Last reason: %s",
+                              self._spawn_attempts, ack.get("message"))
+                    self.disconnect()
+                    return
+                failed = self._spawn_index
+                self._spawn_index = (self._spawn_index + 1) % self._num_spawn_points
+                log.warning("Spawn at index %d failed: %s. Trying index %d...",
+                            failed, ack.get("message"), self._spawn_index)
+                self.send_spawn_at_index(
+                    blueprint_id="vehicle.tesla.model3",
+                    spawn_point_index=self._spawn_index,
+                    autopilot=False,
+                )
 
         elif cmd == "spawn_sensor" and self._state == "SPAWNING_CAMERA":
             if ack.get("status") == "ok" and ack.get("actor_id"):
