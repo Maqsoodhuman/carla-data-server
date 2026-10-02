@@ -4,7 +4,7 @@
 set -u
 CARLA_DIR="${CARLA_DIR:-/home/maqsood/Documents/Cavas_Lab/CARLA_ff009c8a3-dirty}"
 PORT="${PORT:-2000}"
-QUALITY="${QUALITY:-Epic}"
+QUALITY="${QUALITY:-Low}"   # Epic can exceed 6 GB of VRAM
 RESX="${RESX:-1280}"
 RESY="${RESY:-720}"
 
@@ -18,9 +18,15 @@ else
 fi
 
 cd "$CARLA_DIR" || exit 1
+# CARLA renders through Vulkan. On a hybrid-graphics laptop the Vulkan loader
+# also offers the Intel GPU and lvp (a CPU renderer), and Unreal picks one of
+# those - CARLA then runs at ~4 Hz with the RTX idle. Exposing only NVIDIA's
+# driver is the one setting that reliably moves it onto the GPU.
+NV_ICD=/usr/share/vulkan/icd.d/nvidia_icd.json
+VK_ICD_FILENAMES="$NV_ICD" \
+VK_DRIVER_FILES="$NV_ICD" \
 __NV_PRIME_RENDER_OFFLOAD=1 \
 __GLX_VENDOR_LIBRARY_NAME=nvidia \
-__VK_LAYER_NV_optimus=NVIDIA_only \
 ./CarlaUE4.sh -carla-rpc-port="$PORT" -quality-level="$QUALITY" $MODE &
 
 echo "starting CARLA on port $PORT ..."
