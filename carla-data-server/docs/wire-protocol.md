@@ -117,6 +117,22 @@ same frame as the last one **publishes nothing** — so an owner slower than
 snapshots, and a clock owner that has died makes the stream go quiet instead of
 repeating one state forever. The server warns once per second while stalled.
 
+## Spawn points are not all usable
+
+`list_spawn_points` returns what the map's OpenDRIVE declares, and on some maps
+that road network covers more area than the built geometry — `spawn` at one of
+those points puts a vehicle over empty space, where it falls forever with a
+black camera and nothing reported anywhere.
+
+So `spawn` probes for ground beneath a **vehicle** before creating it, and acks
+`failed` when there is none rather than returning an actor id that is already
+doomed. Sensors are not probed: placing one high above the map is a legitimate
+thing to do.
+
+On `UBAutonomousProvingGrounds` this matters — its OpenDRIVE spans roughly
+x -549..1699, y -1996..148, while the built area is about x -465..495,
+y -1684..9. Roughly 4 in 10 of its spawn points are over nothing.
+
 ## Publish-rate contract
 
 - `world_state` is broadcast once per server tick, at `--tick-rate` (default

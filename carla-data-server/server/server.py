@@ -85,6 +85,12 @@ if not CARLA_AVAILABLE:
 # Defaults (overridable via CLI)
 DEFAULT_SILENCE_TIMEOUT = 5.0   # seconds without inbound traffic before eviction
 DEFAULT_TRAFFIC_RATE_DIVISOR = 1  # refresh pedestrians/traffic_lights every Nth tick
+
+# How far to look for ground under a spawn point, in metres. Up a little
+# because a spawn point usually sits just above the road; down far enough to
+# clear a dip, but not so far that a spawn over a canyon reads as solid.
+GROUND_PROBE_UP = 3.0
+GROUND_PROBE_DOWN = 30.0
 JANITOR_INTERVAL = 1.0          # how often the janitor scans
 CLIENT_QUEUE_MAX = 10
 
@@ -356,6 +362,26 @@ class CarlaConnection:
             "sensors": sensors,
         }
 
+    def _has_ground(self, location) -> bool:
+        """Is there anything solid under this point?
+
+        A map whose OpenDRIVE road network extends past its built geometry
+        offers spawn points over empty space. Spawning there succeeds, and the
+        car then falls forever with a black camera and nothing reported
+        anywhere - the failure looks exactly like a working spawn.
+
+        Caller already holds _lock.
+        """
+        above = carla.Location(location.x, location.y, location.z + GROUND_PROBE_UP)
+        below = carla.Location(location.x, location.y, location.z - GROUND_PROBE_DOWN)
+        try:
+            return bool(self.world.cast_ray(above, below))
+        except (RuntimeError, AttributeError) as e:
+            # Older simulators have no cast_ray. Never block a spawn over a
+            # question we could not ask.
+            log.debug("ground probe unavailable, allowing spawn: %s", e)
+            return True
+
     def spawn_actor(self, blueprint_id: str, transform: Optional[dict],
                     autopilot: bool, spawn_point_index: Optional[int] = None) -> Optional[int]:
         if not CARLA_AVAILABLE:
@@ -381,6 +407,16 @@ class CarlaConnection:
                     carla.Rotation(pitch=rot["pitch"], yaw=rot["yaw"], roll=rot["roll"]),
                 )
             else:
+                return None
+
+            # Only vehicles: a sensor placed high above the map on purpose is
+            # legitimate, a car hanging in the air is not.
+            if blueprint_id.startswith("vehicle.") and not self._has_ground(t.location):
+                log.warning("refusing to spawn %s at (%.1f, %.1f, %.1f): no ground "
+                            "within %.0f m below it, so it would fall. This map's "
+                            "road network covers more area than its built geometry.",
+                            blueprint_id, t.location.x, t.location.y, t.location.z,
+                            GROUND_PROBE_DOWN)
                 return None
 
             actor = self.world.try_spawn_actor(bp, t)
