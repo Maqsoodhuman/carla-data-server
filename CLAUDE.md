@@ -96,6 +96,13 @@ The server is a hybrid threaded + asyncio process. Understanding which thread ow
 
 Cross-thread queues (`queue.Queue` for command/broadcast, `asyncio.Queue` for send/peer-event) are the ONLY communication path. Every `asyncio.Queue` is bounded and drops-oldest on overflow (`_enqueue_drop_oldest`) — do not remove this behavior; a slow client must not stall the tick loop.
 
+Mixed-client testing against one shared simulator — Autoware, UB-MR and a
+manually driven CARLA client coexisting — is specified in
+`docs/shared-simulator-testing.md`. The distinction it turns on: a client
+attached straight to CARLA (Autoware, `manual_control.py`) spawns its own actor,
+so this server never owns it and `external_participant` is the only scenario
+covering that path. Autoware also owns the clock, which forces `--observe`.
+
 `orchestration/` is a separate layer on top, not part of the server: a coordinator (stdlib HTTP, run state machine, agent mailbox) plus LAB and CLIENT workers that drive the scenarios in `orchestration/scenarios.py` across two machines. It only ever talks to the server through the documented wire protocol, the same as any other client.
 
 ## Wire protocol

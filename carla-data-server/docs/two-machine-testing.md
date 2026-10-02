@@ -42,6 +42,7 @@ recorded as `error`, not `pass`.
 | `reconnect` | lab restarts the data server; client must observe the outage, reconnect, get a new `client_id`, resume streaming | no |
 | `mirror` | `carla_mirror_client.py` replicates into a shadow CARLA, maps match, actors appear | **yes** + shadow sim |
 | `camera_follow` | `scripts/camera_follow.py` repositions a local CARLA spectator to track an actor | **yes** |
+| `external_participant` | a car spawned straight into CARLA (as Autoware and `manual_control.py` do, bypassing this server) reaches clients, keeps its `role_name`, is nobody's ego, tracks its real position, and leaves when destroyed | **yes** |
 
 Scenarios that need a real simulator are **SKIPPED**, never passed or failed,
 when the server is in STUB mode or no CARLA is reachable — STUB mode serves a
@@ -58,6 +59,7 @@ across Redis roles, so this server can stand in for that hub:
 | `traffic-publisher` | 2 (traffic batch) | the data server itself (authoritative) |
 | `traffic-renderer` | subscribes 2 | `mirror` |
 | `ego-renderer` | 0 (participant pose) | `multi_client` (peer car visible and correctly placed) |
+| external participant (Autoware, `manual_control.py`) | n/a — attaches to CARLA, not to any hub | `external_participant` |
 | `multi-agent-renderer` | 0 / 1 | `multi_client` + `peer_departure` |
 | `manual-control` | 0 | `ego_control` |
 | `udp-bridge` | 3 (MR ego relay) | `udp_bridge` |
@@ -231,6 +233,7 @@ Status as of 2026-09-21, and what each claim rests on:
 | `peer_departure` | PASS (event only) | **not yet run** | not run |
 | `udp_bridge` | PASS (5 assertions) | **not yet run** | not run |
 | `camera_follow` | SKIPPED (no local CARLA) | **not yet run** | not run |
+| `external_participant` | SKIPPED (no CARLA) | **not yet run** | not run |
 
 So: the first five are proven on real hardware; the five added for role parity
 are implemented and unit-covered, but four of them have never executed against

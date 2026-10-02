@@ -10,6 +10,7 @@ Reuses the repo's own client stack rather than re-implementing the protocol:
 """
 
 import json
+import math
 import os
 import socket
 import statistics
@@ -1003,6 +1004,206 @@ def scenario_mirror(ctx: ScenarioContext) -> Outcome:
     return Outcome(P.status_from_assertions(assertions), metrics, assertions)
 
 
+def _distance(a: dict, b: dict) -> float:
+    if not a or not b:
+        return float("inf")
+    try:
+        return math.sqrt(sum((float(a[k]) - float(b[k])) ** 2 for k in ("x", "y", "z")))
+    except (KeyError, TypeError):
+        return float("inf")
+
+
+def _reported_location(vehicle) -> dict:
+    return ((vehicle or {}).get("transform") or {}).get("location") or {}
+
+
+def _frame_showing_both(collector, id_a, id_b, window: int = 25):
+    """One frame in which this client saw both cars at once.
+
+    Checking them in separate frames would not prove what matters here - that a
+    single viewer holds a coherent picture of a world whose participants
+    arrived by different routes.
+    """
+    with collector.lock:
+        for _, state in reversed(collector.states[-window:]):
+            seen = {v.get("id"): v for v in state.get("vehicles", [])}
+            if id_a in seen and id_b in seen:
+                return seen[id_a], seen[id_b]
+    return None, None
+
+
+def scenario_external_participant(ctx: ScenarioContext) -> Outcome:
+    """Does a car this server never spawned still reach every client correctly?
+
+    Autoware and CARLA's own manual_control.py do not connect here. They attach
+    straight to the simulator over the PythonAPI and spawn their own actor, so
+    nothing in this server owns it: it is not in `_actor_cache`, no
+    `ClientSession` claims it, and the janitor will never evict it. Every other
+    actor-level scenario drives cars the server spawned on a client's behalf,
+    which makes this the only one covering the path those two participants
+    actually use.
+
+    That path is the point of a central simulator carrying independently
+    controlled clients of mixed kinds, so what has to hold is: the foreign car
+    reaches our clients, keeps the tag its own spawner gave it, is not mistaken
+    for anyone's ego, tracks its real position as it moves, and disappears when
+    its owner destroys it.
+    """
+    cfg = ctx.config
+    spawn_index = int(ctx.params.get("spawn_index", 0))
+    role_name = ctx.params.get("external_role_name", "ego_vehicle")
+    tolerance_m = float(ctx.params.get("position_tolerance_m", 3.0))
+    assertions, metrics = [], {}
+
+    try:
+        import carla
+    except ImportError:
+        return Outcome(P.SKIPPED, {"reason": "carla PythonAPI not importable"}, [],
+                       errors=[{"kind": "precondition",
+                                "message": "this scenario spawns an actor directly in "
+                                           "the shared simulator, so it needs the "
+                                           "PythonAPI: use venv/, not venv-stub/"}])
+    try:
+        sim = carla.Client(cfg.carla_host, cfg.carla_port)
+        sim.set_timeout(10.0)
+        world = sim.get_world()
+        points = world.get_map().get_spawn_points()
+        blueprint = world.get_blueprint_library().find("vehicle.audi.tt")
+    except (RuntimeError, OSError) as exc:
+        return Outcome(
+            P.SKIPPED,
+            {"reason": f"no CARLA reachable at {cfg.carla_host}:{cfg.carla_port}"},
+            [], errors=[{"kind": "precondition", "message": str(exc)}])
+    if len(points) < 3:
+        return Outcome(P.SKIPPED, {"reason": "map has too few spawn points"}, [],
+                       errors=[{"kind": "precondition",
+                                "message": f"{len(points)} spawn points available"}])
+
+    # Record whatever the simulator reports, because this default is compiled
+    # into the server build and cannot be read off the Python package. It
+    # decides whether role_name can tell a participant from traffic at all.
+    if blueprint.has_attribute("role_name"):
+        metrics["blueprint_role_name_default"] = blueprint.get_attribute(
+            "role_name").as_str()
+        blueprint.set_attribute("role_name", role_name)
+    else:
+        metrics["blueprint_role_name_default"] = None
+
+    viewer = _Collector(cfg.data_server_url, ["vehicles"], role="orchestration-viewer")
+    thread = viewer.run_in_thread()
+    external = None
+    try:
+        if not _wait_for(lambda: viewer.connections, 20.0):
+            return Outcome(P.FAIL, metrics, [P.assertion(
+                "viewer_connected", False, expected="a connected client",
+                observed="no welcome received")])
+
+        # One car by each route, so the two can be compared in the same frame.
+        own_ego = _spawn_ego(viewer, spawn_index)
+        metrics["own_ego_id"] = own_ego
+        if not own_ego:
+            return Outcome(P.FAIL, metrics, [P.assertion(
+                "own_ego_spawned", False, expected="an ego spawned via the server",
+                observed="no spawn ack")])
+        if not _wait_for(lambda: viewer.vehicle_by_id(own_ego) is not None, 10.0):
+            return _stub_mode_skip(
+                f"ego {own_ego} was acked but never appeared in world_state")
+
+        # Never tick here. In synchronous mode the clock belongs to exactly one
+        # process - this data server, or whatever it is observing - and a second
+        # ticker would double-step the world for every participant.
+        for offset in range(1, len(points)):
+            external = world.try_spawn_actor(
+                blueprint, points[(spawn_index + offset) % len(points)])
+            if external is not None:
+                break
+        if external is None:
+            return Outcome(P.SKIPPED,
+                           {**metrics, "reason": "every spawn point was blocked"}, [],
+                           errors=[{"kind": "precondition",
+                                    "message": "no free spawn point for the external "
+                                               "participant"}])
+        external_id = external.id
+        metrics["external_actor_id"] = external_id
+        ctx.log(f"spawned external participant {external_id} role_name={role_name!r} "
+                f"directly in CARLA, bypassing the data server")
+
+        appeared = _wait_for(
+            lambda: viewer.vehicle_by_id(external_id) is not None, 15.0)
+        assertions.append(P.assertion(
+            "external_actor_reaches_clients", appeared,
+            expected="a car spawned outside the server still appears in world_state",
+            observed="present" if appeared else "never seen"))
+        if not appeared:
+            return Outcome(P.FAIL, metrics, assertions)
+
+        mine, theirs = _frame_showing_both(viewer, own_ego, external_id)
+        assertions.append(P.assertion(
+            "one_frame_shows_both_participants",
+            mine is not None and theirs is not None,
+            expected="a single frame carrying both the server-spawned and the "
+                     "foreign car",
+            observed="found" if mine and theirs else "never co-present in one frame"))
+
+        if theirs is not None:
+            metrics["external_role_name"] = theirs.get("role_name")
+            assertions.append(P.assertion(
+                "external_role_name_preserved", theirs.get("role_name") == role_name,
+                expected=f"role_name {role_name!r} survives the server untouched",
+                observed=repr(theirs.get("role_name"))))
+            assertions.append(P.assertion(
+                "external_not_flagged_as_ego", theirs.get("is_ego") is False,
+                expected="a car nobody here owns is no client's ego",
+                observed=f"is_ego={theirs.get('is_ego')!r}"))
+        if mine is not None:
+            assertions.append(P.assertion(
+                "own_ego_still_flagged", mine.get("is_ego") is True,
+                expected="a foreign participant does not disturb is_ego for our car",
+                observed=f"is_ego={mine.get('is_ego')!r}"))
+
+        truth = external.get_transform().location
+        error_m = _distance({"x": truth.x, "y": truth.y, "z": truth.z},
+                            _reported_location(viewer.vehicle_by_id(external_id,
+                                                                    lookback=3)))
+        metrics["position_error_m"] = round(error_m, 3) if error_m != float("inf") else None
+        assertions.append(P.assertion(
+            "external_position_matches_simulator", error_m <= tolerance_m,
+            expected=f"reported position within {tolerance_m} m of the simulator",
+            observed=f"{error_m:.2f} m" if error_m != float("inf") else "no position"))
+
+        # Move it the way its real owner would. A position that matches once
+        # could just be a stale first sighting that never updates again.
+        before = _reported_location(viewer.vehicle_by_id(external_id, lookback=3))
+        external.set_transform(points[(spawn_index + 2) % len(points)])
+        moved = _wait_for(lambda: _distance(before, _reported_location(
+            viewer.vehicle_by_id(external_id, lookback=3))) > 5.0, 15.0)
+        after = _reported_location(viewer.vehicle_by_id(external_id, lookback=3))
+        travelled = _distance(before, after)
+        metrics["reported_move_m"] = round(travelled, 2) if travelled != float("inf") else None
+        assertions.append(P.assertion(
+            "external_motion_tracked", moved,
+            expected="the feed follows a car that its own owner moves",
+            observed=f"reported displacement {metrics['reported_move_m']} m"))
+
+        external.destroy()
+        external = None
+        gone = _wait_for(
+            lambda: viewer.vehicle_by_id(external_id, lookback=2) is None, 15.0)
+        assertions.append(P.assertion(
+            "external_departure_visible", gone,
+            expected="the car leaves world_state when its owner destroys it",
+            observed="gone" if gone else "still being broadcast"))
+    finally:
+        if external is not None:
+            try:
+                external.destroy()
+            except Exception:
+                pass
+        viewer.disconnect()
+        thread.join(timeout=5.0)
+
+    return Outcome(P.status_from_assertions(assertions), metrics, assertions)
+
 REGISTRY = {
     "connectivity": scenario_connectivity,
     "world_state": scenario_world_state,
@@ -1014,13 +1215,14 @@ REGISTRY = {
     "reconnect": scenario_reconnect,
     "mirror": scenario_mirror,
     "camera_follow": scenario_camera_follow,
+    "external_participant": scenario_external_participant,
 }
 
 # Cheapest and most fundamental first, so a broken link fails fast; the
 # CARLA-dependent and subprocess-heavy ones come last.
 DEFAULT_SUITE = ["connectivity", "world_state", "sustained_stream", "ego_control",
-                 "multi_client", "peer_departure", "udp_bridge", "reconnect",
-                 "mirror", "camera_follow"]
+                 "multi_client", "peer_departure", "external_participant",
+                 "udp_bridge", "reconnect", "mirror", "camera_follow"]
 
 # Generous per-scenario ceilings; the coordinator sweeps anything that exceeds them.
 TIMEOUTS = {
@@ -1028,6 +1230,7 @@ TIMEOUTS = {
     "world_state": 120.0,
     "sustained_stream": 180.0,
     "ego_control": 180.0,
+    "external_participant": 240.0,
     "multi_client": 180.0,
     "peer_departure": 180.0,
     "udp_bridge": 150.0,
